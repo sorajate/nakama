@@ -19,7 +19,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -112,8 +112,8 @@ func (s *ApiServer) ListLeaderboardRecords(ctx context.Context, in *api.ListLead
 
 	var limit *wrapperspb.Int32Value
 	if in.GetLimit() != nil {
-		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
-			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 1000 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 1000.")
 		}
 		limit = in.GetLimit()
 	} else if len(in.GetOwnerIds()) == 0 || in.GetCursor() != "" {

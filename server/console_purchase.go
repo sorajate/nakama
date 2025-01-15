@@ -17,7 +17,7 @@ package server
 import (
 	"context"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
@@ -44,4 +44,17 @@ func (s *ConsoleServer) ListPurchases(ctx context.Context, in *console.ListPurch
 	}
 
 	return purchases, nil
+}
+
+func (s *ConsoleServer) GetPurchase(ctx context.Context, in *console.GetPurchaseRequest) (*api.ValidatedPurchase, error) {
+	if in.GetTransactionId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "transaction id is required")
+	}
+
+	purchase, err := GetPurchaseByTransactionId(ctx, s.logger, s.db, in.TransactionId)
+	if err != nil || purchase == nil {
+		return nil, status.Error(codes.NotFound, "Purchase not found")
+	}
+
+	return purchase, nil
 }

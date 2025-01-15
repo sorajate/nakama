@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -28,8 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
-	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/gofrs/uuid/v5"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	grpcgw "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
@@ -60,6 +61,9 @@ var restrictedMethods = map[string]console.UserRole{
 	"/nakama.console.Console/GetWalletLedger":    console.UserRole_USER_ROLE_READONLY,
 	"/nakama.console.Console/ListAccounts":       console.UserRole_USER_ROLE_READONLY,
 	"/nakama.console.Console/UpdateAccount":      console.UserRole_USER_ROLE_MAINTAINER,
+
+	// Authenticate
+	"/nakama.console.Console/AuthenticateMFASetup": console.UserRole_USER_ROLE_READONLY,
 
 	// API Explorer
 	"/nakama.console.Console/CallRpcEndpoint":  console.UserRole_USER_ROLE_DEVELOPER,
@@ -95,8 +99,16 @@ var restrictedMethods = map[string]console.UserRole{
 	"/nakama.console.Console/ListChannelMessages":   console.UserRole_USER_ROLE_READONLY,
 	"/nakama.console.Console/DeleteChannelMessages": console.UserRole_USER_ROLE_MAINTAINER,
 
+	// Notifications
+	"/nakama.console.Console/GetNotification":    console.UserRole_USER_ROLE_READONLY,
+	"/nakama.console.Console/ListNotifications":  console.UserRole_USER_ROLE_READONLY,
+	"/nakama.console.Console/DeleteNotification": console.UserRole_USER_ROLE_MAINTAINER,
+
 	// Purchase
 	"/nakama.console.Console/ListPurchases": console.UserRole_USER_ROLE_READONLY,
+
+	// Subscription
+	"/nakama.console.Console/ListSubscriptions": console.UserRole_USER_ROLE_READONLY,
 
 	// Runtime
 	"/nakama.console.Console/GetRuntime": console.UserRole_USER_ROLE_DEVELOPER,
@@ -124,11 +136,14 @@ var restrictedMethods = map[string]console.UserRole{
 	"/nakama.console.Console/UnlinkSteam":               console.UserRole_USER_ROLE_MAINTAINER,
 
 	// User
-	"/nakama.console.Console/AddUser":    console.UserRole_USER_ROLE_ADMIN,
-	"/nakama.console.Console/DeleteUser": console.UserRole_USER_ROLE_ADMIN,
-	"/nakama.console.Console/ListUsers":  console.UserRole_USER_ROLE_ADMIN,
+	"/nakama.console.Console/AddUser":        console.UserRole_USER_ROLE_ADMIN,
+	"/nakama.console.Console/DeleteUser":     console.UserRole_USER_ROLE_ADMIN,
+	"/nakama.console.Console/ListUsers":      console.UserRole_USER_ROLE_ADMIN,
+	"/nakama.console.Console/ResetUserMfa":   console.UserRole_USER_ROLE_ADMIN,
+	"/nakama.console.Console/RequireUserMfa": console.UserRole_USER_ROLE_ADMIN,
 }
 
+type ctxConsoleIdKey struct{}
 type ctxConsoleUsernameKey struct{}
 type ctxConsoleEmailKey struct{}
 type ctxConsoleRoleKey struct{}
@@ -146,9 +161,10 @@ type ConsoleServer struct {
 	sessionRegistry      SessionRegistry
 	consoleSessionCache  SessionCache
 	loginAttemptCache    LoginAttemptCache
-	statusRegistry       *StatusRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
 	statusHandler        StatusHandler
+	storageIndex         StorageIndex
 	runtimeInfo          *RuntimeInfo
 	configWarnings       map[string]string
 	serverVersion        string
@@ -164,7 +180,7 @@ type ConsoleServer struct {
 	httpClient           *http.Client
 }
 
-func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, sessionRegistry SessionRegistry, sessionCache SessionCache, consoleSessionCache SessionCache, loginAttemptCache LoginAttemptCache, statusRegistry *StatusRegistry, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, api *ApiServer, runtime *Runtime, cookie string) *ConsoleServer {
+func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, streamManager StreamManager, metrics Metrics, sessionRegistry SessionRegistry, sessionCache SessionCache, consoleSessionCache SessionCache, loginAttemptCache LoginAttemptCache, statusRegistry StatusRegistry, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, storageIndex StorageIndex, api *ApiServer, runtime *Runtime, cookie string) *ConsoleServer {
 	var gatewayContextTimeoutMs string
 	if config.GetConsole().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -205,6 +221,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		leaderboardCache:     leaderboardCache,
 		leaderboardRankCache: leaderboardRankCache,
 		leaderboardScheduler: leaderboardScheduler,
+		storageIndex:         storageIndex,
 		api:                  api,
 		cookie:               cookie,
 		httpClient:           &http.Client{Timeout: 5 * time.Second},
@@ -280,6 +297,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 	grpcGatewayRouter.Handle("/debug/pprof/", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Index)))
 	grpcGatewayRouter.Handle("/debug/pprof/cmdline", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Cmdline)))
 	grpcGatewayRouter.Handle("/debug/pprof/profile", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Profile)))
+	grpcGatewayRouter.Handle("/debug/pprof/profile_js", adminBasicAuth(config.GetConsole())(http.HandlerFunc(ProfileGoja)))
 	grpcGatewayRouter.Handle("/debug/pprof/symbol", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Symbol)))
 	grpcGatewayRouter.Handle("/debug/pprof/trace", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Trace)))
 	grpcGatewayRouter.Handle("/debug/pprof/{profile}", adminBasicAuth(config.GetConsole())(http.HandlerFunc(pprof.Index)))
@@ -306,7 +324,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 	// Enable CORS on all requests.
 	CORSHeaders := handlers.AllowedHeaders([]string{"Authorization", "Content-Type", "User-Agent"})
 	CORSOrigins := handlers.AllowedOrigins([]string{"*"})
-	CORSMethods := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"})
+	CORSMethods := handlers.AllowedMethods([]string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch})
 	handlerWithCORS := handlers.CORS(CORSHeaders, CORSOrigins, CORSMethods)(grpcGatewayRouter)
 
 	// Set up and start GRPC Gateway server.
@@ -320,7 +338,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 
 	startupLogger.Info("Starting Console server gateway for HTTP requests", zap.Int("port", config.GetConsole().Port))
 	go func() {
-		if err := s.grpcGatewayServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.grpcGatewayServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			startupLogger.Fatal("Console server gateway listener failed", zap.Error(err))
 		}
 	}()
@@ -362,7 +380,7 @@ SELECT collection FROM t WHERE collection IS NOT NULL`
 			sort.Strings(collections)
 			collectionSetCache.Store(collections)
 
-			elapsed := time.Now().Sub(startAt)
+			elapsed := time.Since(startAt)
 			elapsed *= 20
 			if elapsed < time.Minute {
 				elapsed = time.Minute
@@ -408,8 +426,7 @@ func registerDashboardHandlers(logger *zap.Logger, router *mux.Router) {
 
 		w.Header().Add("Cache-Control", "no-cache")
 		w.Header().Set("X-Frame-Options", "deny")
-		w.Write(indexBytes)
-		return
+		_, _ = w.Write(indexBytes)
 	}
 
 	router.Path("/").HandlerFunc(indexFn)
@@ -497,13 +514,16 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth stri
 		if username == config.GetConsole().Username {
 			if password != config.GetConsole().Password {
 				// Admin password does not match.
-				if lockout, until := loginAttemptCache.Add(config.GetConsole().Username, ip); lockout != LockoutTypeNone {
-					switch lockout {
-					case LockoutTypeAccount:
-						logger.Info(fmt.Sprintf("Console admin account locked until %v.", until))
-					case LockoutTypeIp:
-						logger.Info(fmt.Sprintf("Console admin IP locked until %v.", until))
-					}
+				lockout, until := loginAttemptCache.Add(config.GetConsole().Username, ip)
+				switch lockout {
+				case LockoutTypeAccount:
+					logger.Info(fmt.Sprintf("Console admin account locked until %v.", until))
+				case LockoutTypeIp:
+					logger.Info(fmt.Sprintf("Console admin IP locked until %v.", until))
+				case LockoutTypeNone:
+					fallthrough
+				default:
+					// No lockout.
 				}
 				return ctx, false
 			}
@@ -532,10 +552,6 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth stri
 			// The token or its claims are invalid.
 			return ctx, false
 		}
-		if !ok {
-			// Expiry time claim is invalid.
-			return ctx, false
-		}
 		if exp <= time.Now().UTC().Unix() {
 			// Token expired.
 			return ctx, false
@@ -549,7 +565,7 @@ func checkAuth(ctx context.Context, logger *zap.Logger, config Config, auth stri
 			return ctx, false
 		}
 
-		ctx = context.WithValue(context.WithValue(context.WithValue(ctx, ctxConsoleRoleKey{}, role), ctxConsoleUsernameKey{}, uname), ctxConsoleEmailKey{}, email)
+		ctx = context.WithValue(context.WithValue(context.WithValue(context.WithValue(ctx, ctxConsoleRoleKey{}, role), ctxConsoleUsernameKey{}, uname), ctxConsoleEmailKey{}, email), ctxConsoleIdKey{}, userId)
 
 		return ctx, true
 	}

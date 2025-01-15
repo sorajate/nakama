@@ -23,17 +23,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/heroiclabs/nakama/v3/internal/satori"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
+	"github.com/heroiclabs/nakama/v3/internal/satori"
 	"github.com/heroiclabs/nakama/v3/social"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -46,7 +46,6 @@ type RuntimeGoNakamaModule struct {
 	logger               *zap.Logger
 	db                   *sql.DB
 	protojsonMarshaler   *protojson.MarshalOptions
-	protojsonUnmarshaler *protojson.UnmarshalOptions
 	config               Config
 	socialClient         *social.Client
 	leaderboardCache     LeaderboardCache
@@ -54,7 +53,7 @@ type RuntimeGoNakamaModule struct {
 	leaderboardScheduler LeaderboardScheduler
 	sessionRegistry      SessionRegistry
 	sessionCache         SessionCache
-	statusRegistry       *StatusRegistry
+	statusRegistry       StatusRegistry
 	matchRegistry        MatchRegistry
 	tracker              Tracker
 	metrics              Metrics
@@ -64,9 +63,11 @@ type RuntimeGoNakamaModule struct {
 	node                 string
 	matchCreateFn        RuntimeMatchCreateFunction
 	satori               runtime.Satori
+	fleetManager         runtime.FleetManager
+	storageIndex         StorageIndex
 }
 
-func NewRuntimeGoNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter) *RuntimeGoNakamaModule {
+func NewRuntimeGoNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, storageIndex StorageIndex) *RuntimeGoNakamaModule {
 	return &RuntimeGoNakamaModule{
 		logger:               logger,
 		db:                   db,
@@ -84,10 +85,18 @@ func NewRuntimeGoNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler
 		metrics:              metrics,
 		streamManager:        streamManager,
 		router:               router,
+		storageIndex:         storageIndex,
 
 		node: config.GetName(),
 
-		satori: satori.NewSatoriClient(logger, config.GetSatori().Url, config.GetSatori().ApiKeyName, config.GetSatori().ApiKey, config.GetSatori().SigningKey),
+		satori: satori.NewSatoriClient(
+			logger,
+			config.GetSatori().Url,
+			config.GetSatori().ApiKeyName,
+			config.GetSatori().ApiKey,
+			config.GetSatori().SigningKey,
+			config.GetSession().TokenExpirySec,
+		),
 	}
 }
 
@@ -125,7 +134,7 @@ func (n *RuntimeGoNakamaModule) AuthenticateApple(ctx context.Context, token, us
 // @summary Authenticate user and create a session token using a custom authentication managed by an external service or source not already supported by Nakama.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) Custom ID to use to authenticate the user. Must be between 6-128 characters.
-// @param username(type=string) The user's username. If left empty, one is generated.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
 // @param create(type=bool) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
@@ -155,8 +164,8 @@ func (n *RuntimeGoNakamaModule) AuthenticateCustom(ctx context.Context, id, user
 // @summary Authenticate user and create a session token using a device identifier.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) Device ID to use to authenticate the user. Must be between 1-128 characters.
-// @param username(type=string) The user's username. If left empty, one is generated.
-// @param create(type=bool) Create user if one didn't exist previously. By default this is set to true.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
+// @param create(type=bool, optional=true, default=true) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
 // @return create(bool) Value indicating if this account was just created or already existed.
@@ -186,8 +195,8 @@ func (n *RuntimeGoNakamaModule) AuthenticateDevice(ctx context.Context, id, user
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param email(type=string) Email address to use to authenticate the user. Must be between 10-255 characters.
 // @param password(type=string) Password to set. Must be longer than 8 characters.
-// @param username(type=string) The user's username. If left empty, one is generated.
-// @param create(type=bool) Create user if one didn't exist previously. By default this is set to true.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
+// @param create(type=bool, optional=true, default=true) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
 // @return create(bool) Value indicating if this account was just created or already existed.
@@ -237,7 +246,7 @@ func (n *RuntimeGoNakamaModule) AuthenticateEmail(ctx context.Context, email, pa
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param token(type=string) Facebook OAuth or Limited Login (JWT) access token.
 // @param import(type=bool) Whether to automatically import Facebook friends after authentication.
-// @param username(type=string) The user's username. If left empty, one is generated.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
 // @param create(type=bool) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
@@ -256,10 +265,10 @@ func (n *RuntimeGoNakamaModule) AuthenticateFacebook(ctx context.Context, token 
 		return "", "", false, errors.New("expects id to be valid, must be 1-128 bytes")
 	}
 
-	dbUserID, dbUsername, created, importFriendsPossible, err := AuthenticateFacebook(ctx, n.logger, n.db, n.socialClient, n.config.GetSocial().FacebookLimitedLogin.AppId, token, username, create)
-	if err == nil && importFriends && importFriendsPossible {
+	dbUserID, dbUsername, created, err := AuthenticateFacebook(ctx, n.logger, n.db, n.socialClient, n.config.GetSocial().FacebookLimitedLogin.AppId, token, username, create)
+	if err == nil && importFriends {
 		// Errors are logged before this point and failure here does not invalidate the whole operation.
-		_ = importFacebookFriends(ctx, n.logger, n.db, n.router, n.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, token, false)
+		_ = importFacebookFriends(ctx, n.logger, n.db, n.tracker, n.router, n.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, token, false)
 	}
 
 	return dbUserID, dbUsername, created, err
@@ -269,7 +278,7 @@ func (n *RuntimeGoNakamaModule) AuthenticateFacebook(ctx context.Context, token 
 // @summary Authenticate user and create a session token using a Facebook Instant Game.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param playerInfo(type=string) Facebook Player info.
-// @param username(type=string) The user's username. If left empty, one is generated.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
 // @param create(type=bool) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
@@ -300,7 +309,7 @@ func (n *RuntimeGoNakamaModule) AuthenticateFacebookInstantGame(ctx context.Cont
 // @param salt(type=string) A random string returned by Game Center authentication on client.
 // @param signature(type=string) A signature returned by Game Center authentication on client.
 // @param publicKeyUrl(type=string) A URL to the public key returned by Game Center authentication on client.
-// @param username(type=string) The user's username. If left empty, one is generated.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
 // @param create(type=bool) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
@@ -367,8 +376,8 @@ func (n *RuntimeGoNakamaModule) AuthenticateGoogle(ctx context.Context, token, u
 // @summary Authenticate user and create a session token using a Steam account token.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param token(type=string) Steam token.
-// @param username(type=string) The user's username. If left empty, one is generated.
-// @param create(type=bool) Create user if one didn't exist previously. By default this is set to true.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
+// @param create(type=bool, optional=true, default=true) Create user if one didn't exist previously.
 // @return userID(string) The user ID of the authenticated user.
 // @return username(string) The username of the authenticated user.
 // @return create(bool) Value indicating if this account was just created or already existed.
@@ -398,12 +407,11 @@ func (n *RuntimeGoNakamaModule) AuthenticateSteam(ctx context.Context, token, us
 // @group authenticate
 // @summary Generate a Nakama session token from a user ID.
 // @param userId(type=string) User ID to use to generate the token.
-// @param username(type=string) The user's username. If left empty, one is generated.
-// @param expiresAt(type=int64) UTC time in seconds when the token must expire. Defaults to server configured expiry time.
-// @param vars(type=map[string]string) Extra information that will be bundled in the session token.
+// @param username(type=string, optional=true) The user's username. If left empty, one is generated.
+// @param expiresAt(type=int64, optional=true) UTC time in seconds when the token must expire. Defaults to server configured expiry time.
+// @param vars(type=map[string]string, optional=true) Extra information that will be bundled in the session token.
 // @return token(string) The Nakama session token.
 // @return validity(int64) The period for which the token remains valid.
-// @return create(bool) Value indicating if this account was just created or already existed.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) AuthenticateTokenGenerate(userID, username string, exp int64, vars map[string]string) (string, int64, error) {
 	if userID == "" {
@@ -423,8 +431,10 @@ func (n *RuntimeGoNakamaModule) AuthenticateTokenGenerate(userID, username strin
 		exp = time.Now().UTC().Add(time.Duration(n.config.GetSession().TokenExpirySec) * time.Second).Unix()
 	}
 
-	token, exp := generateTokenWithExpiry(n.config.GetSession().EncryptionKey, userID, username, vars, exp)
-	n.sessionCache.Add(uid, exp, token, 0, "")
+	tokenId := uuid.Must(uuid.NewV4()).String()
+	tokenIssuedAt := time.Now().Unix()
+	token, exp := generateTokenWithExpiry(n.config.GetSession().EncryptionKey, tokenId, tokenIssuedAt, userID, username, vars, exp)
+	n.sessionCache.Add(uid, exp, tokenId, 0, "")
 	return token, exp, nil
 }
 
@@ -452,7 +462,7 @@ func (n *RuntimeGoNakamaModule) AccountGetId(ctx context.Context, userID string)
 // @summary Fetch information for multiple accounts by user IDs.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userIds(type=[]string) Array of user IDs to fetch information for. Must be valid UUID.
-// @return account(*api.Account) An array of accounts.
+// @return account([]*api.Account) An array of accounts.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) AccountsGetId(ctx context.Context, userIDs []string) ([]*api.Account, error) {
 	if len(userIDs) == 0 {
@@ -532,7 +542,7 @@ func (n *RuntimeGoNakamaModule) AccountUpdateId(ctx context.Context, userID, use
 // @summary Delete an account by user ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) User ID for the account to be deleted. Must be valid UUID.
-// @param recorded(type=boolfalse) Whether to record this deletion in the database.
+// @param recorded(type=bool, default=false) Whether to record this deletion in the database.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) AccountDeleteId(ctx context.Context, userID string, recorded bool) error {
 	u, err := uuid.FromString(userID)
@@ -540,7 +550,7 @@ func (n *RuntimeGoNakamaModule) AccountDeleteId(ctx context.Context, userID stri
 		return errors.New("expects user ID to be a valid identifier")
 	}
 
-	return DeleteAccount(ctx, n.logger, n.db, n.config, n.leaderboardRankCache, n.sessionRegistry, n.sessionCache, n.tracker, u, recorded)
+	return DeleteAccount(ctx, n.logger, n.db, n.config, n.leaderboardCache, n.leaderboardRankCache, n.sessionRegistry, n.sessionCache, n.tracker, u, recorded)
 }
 
 // @group accounts
@@ -572,7 +582,7 @@ func (n *RuntimeGoNakamaModule) AccountExportId(ctx context.Context, userID stri
 // @summary Fetch one or more users by ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userIds(type=[]string) An array of user IDs to fetch.
-// @return users([]*api.Users) A list of user record objects.
+// @return users([]*api.User) A list of user record objects.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) UsersGetId(ctx context.Context, userIDs []string, facebookIDs []string) ([]*api.User, error) {
 	if len(userIDs) == 0 && len(facebookIDs) == 0 {
@@ -597,7 +607,7 @@ func (n *RuntimeGoNakamaModule) UsersGetId(ctx context.Context, userIDs []string
 // @summary Fetch one or more users by username.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param usernames(type=[]string) An array of usernames to fetch.
-// @return users([]*api.Users) A list of user record objects.
+// @return users([]*api.User) A list of user record objects.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) UsersGetUsername(ctx context.Context, usernames []string) ([]*api.User, error) {
 	if len(usernames) == 0 {
@@ -619,10 +629,35 @@ func (n *RuntimeGoNakamaModule) UsersGetUsername(ctx context.Context, usernames 
 }
 
 // @group users
+// @summary Get user's friend status information for a list of target users.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userID (type=string) The current user ID.
+// @param userIDs(type=[]string) An array of target user IDs.
+// @return friends([]*api.Friend) A list of user friends objects.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) UsersGetFriendStatus(ctx context.Context, userID string, userIDs []string) ([]*api.Friend, error) {
+	uid, err := uuid.FromString(userID)
+	if err != nil {
+		return nil, errors.New("expects user ID to be a valid identifier")
+	}
+
+	fids := make([]uuid.UUID, 0, len(userIDs))
+	for _, id := range userIDs {
+		fid, err := uuid.FromString(id)
+		if err != nil {
+			return nil, errors.New("expects user ID to be a valid identifier")
+		}
+		fids = append(fids, fid)
+	}
+
+	return GetFriends(ctx, n.logger, n.db, n.statusRegistry, uid, fids)
+}
+
+// @group users
 // @summary Fetch one or more users randomly.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param count(type=int) The number of users to fetch.
-// @return users([]*api.Users) A list of user record objects.
+// @return users([]*api.User) A list of user record objects.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) UsersGetRandom(ctx context.Context, count int) ([]*api.User, error) {
 	if count == 0 {
@@ -745,7 +780,7 @@ func (n *RuntimeGoNakamaModule) LinkEmail(ctx context.Context, userID, email, pa
 // @summary Link Facebook authentication to a user ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The user ID to be linked.
-// @param username(type=string) If left empty, one is generated.
+// @param username(type=string, optional=true) If left empty, one is generated.
 // @param token(type=string) Facebook OAuth or Limited Login (JWT) access token.
 // @param importFriends(type=bool) Whether to automatically import Facebook friends after authentication.
 // @return error(error) An optional error value if an error occurred.
@@ -755,14 +790,14 @@ func (n *RuntimeGoNakamaModule) LinkFacebook(ctx context.Context, userID, userna
 		return errors.New("user ID must be a valid identifier")
 	}
 
-	return LinkFacebook(ctx, n.logger, n.db, n.socialClient, n.router, id, username, n.config.GetSocial().FacebookLimitedLogin.AppId, token, importFriends)
+	return LinkFacebook(ctx, n.logger, n.db, n.socialClient, n.tracker, n.router, id, username, n.config.GetSocial().FacebookLimitedLogin.AppId, token, importFriends)
 }
 
 // @group authenticate
 // @summary Link Facebook Instant Game authentication to a user ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The user ID to be linked.
-// @param playerInfo(type=string) Facebook player info.
+// @param signedPlayerInfo(type=string) Facebook player info.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) LinkFacebookInstantGame(ctx context.Context, userID, signedPlayerInfo string) error {
 	id, err := uuid.FromString(userID)
@@ -812,7 +847,7 @@ func (n *RuntimeGoNakamaModule) LinkGoogle(ctx context.Context, userID, token st
 // @summary Link Steam authentication to a user ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The user ID to be linked.
-// @param username(type=string) If left empty, one is generated.
+// @param username(type=string, optional=true) If left empty, one is generated.
 // @param token(type=string) Steam access token.
 // @param importFriends(type=bool) Whether to automatically import Steam friends after authentication.
 // @return error(error) An optional error value if an error occurred.
@@ -822,7 +857,45 @@ func (n *RuntimeGoNakamaModule) LinkSteam(ctx context.Context, userID, username,
 		return errors.New("user ID must be a valid identifier")
 	}
 
-	return LinkSteam(ctx, n.logger, n.db, n.config, n.socialClient, n.router, id, username, token, importFriends)
+	return LinkSteam(ctx, n.logger, n.db, n.config, n.socialClient, n.tracker, n.router, id, username, token, importFriends)
+}
+
+// @group utils
+// @summary Parses a CRON expression and a timestamp in UTC seconds, and returns the next matching timestamp in UTC seconds.
+// @param expression(type=string) A valid CRON expression in standard format, for example "0 0 * * *" (meaning at midnight).
+// @param timestamp(type=int64) A time value expressed as UTC seconds.
+// @return nextTs(int64) The next UTC seconds timestamp (number) that matches the given CRON expression, and is immediately after the given timestamp.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) CronNext(expression string, timestamp int64) (int64, error) {
+	expr, err := cronexpr.Parse(expression)
+	if err != nil {
+		return 0, errors.New("expects a valid cron string")
+	}
+
+	t := time.Unix(timestamp, 0).UTC()
+	next := expr.Next(t)
+	nextTs := next.UTC().Unix()
+
+	return nextTs, nil
+}
+
+// @group utils
+// @summary Parses a CRON expression and a timestamp in UTC seconds, and returns the previous matching timestamp in UTC seconds.
+// @param expression(type=string) A valid CRON expression in standard format, for example "0 0 * * *" (meaning at midnight).
+// @param timestamp(type=int64) A time value expressed as UTC seconds.
+// @return prevTs(int64) The previous UTC seconds timestamp (number) that matches the given CRON expression, and is immediately before the given timestamp.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) CronPrev(expression string, timestamp int64) (int64, error) {
+	expr, err := cronexpr.Parse(expression)
+	if err != nil {
+		return 0, errors.New("expects a valid cron string")
+	}
+
+	t := time.Unix(timestamp, 0).UTC()
+	next := expr.Last(t)
+	nextTs := next.UTC().Unix()
+
+	return nextTs, nil
 }
 
 // @group utils
@@ -868,7 +941,7 @@ func (n *RuntimeGoNakamaModule) UnlinkCustom(ctx context.Context, userID, custom
 // @summary Unlink device authentication from a user ID.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The user ID to be unlinked.
-// @param deviceId(type=string) Device ID to be unlinked to the user.
+// @param deviceId(type=string) Device ID to be unlinked from the user.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) UnlinkDevice(ctx context.Context, userID, deviceID string) error {
 	id, err := uuid.FromString(userID)
@@ -976,13 +1049,13 @@ func (n *RuntimeGoNakamaModule) UnlinkSteam(ctx context.Context, userID, token s
 
 // @group streams
 // @summary List all users currently online and connected to a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
-// @param includeHidden(type=bool) Include stream presences marked as hidden in the results.
-// @param includeNotHidden(type=bool) Include stream presences not marked as hidden in the results.
-// @return presences([]runtime.Presences) Array of stream presences and their information.
+// @param includeHidden(type=bool, optional=true) Include stream presences marked as hidden in the results.
+// @param includeNotHidden(type=bool, optional=true) Include stream presences not marked as hidden in the results.
+// @return presences([]runtime.Presence) Array of stream presences and their information.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) StreamUserList(mode uint8, subject, subcontext, label string, includeHidden, includeNotHidden bool) ([]runtime.Presence, error) {
 	stream := PresenceStream{
@@ -1012,8 +1085,8 @@ func (n *RuntimeGoNakamaModule) StreamUserList(mode uint8, subject, subcontext, 
 }
 
 // @group streams
-// @summary Retreive a stream presence and metadata by user ID.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @summary Retrieve a stream presence and metadata by user ID.
+// @param mode(type=uint8) The type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1057,7 +1130,7 @@ func (n *RuntimeGoNakamaModule) StreamUserGet(mode uint8, subject, subcontext, l
 
 // @group streams
 // @summary Add a user to a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1109,7 +1182,7 @@ func (n *RuntimeGoNakamaModule) StreamUserJoin(mode uint8, subject, subcontext, 
 
 // @group streams
 // @summary Update a stream user by ID.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1160,7 +1233,7 @@ func (n *RuntimeGoNakamaModule) StreamUserUpdate(mode uint8, subject, subcontext
 
 // @group streams
 // @summary Remove a user from a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1200,7 +1273,7 @@ func (n *RuntimeGoNakamaModule) StreamUserLeave(mode uint8, subject, subcontext,
 
 // @group streams
 // @summary Kick a user from a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1239,7 +1312,7 @@ func (n *RuntimeGoNakamaModule) StreamUserKick(mode uint8, subject, subcontext, 
 
 // @group streams
 // @summary Get a count of stream presences.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1269,7 +1342,7 @@ func (n *RuntimeGoNakamaModule) StreamCount(mode uint8, subject, subcontext, lab
 
 // @group streams
 // @summary Close a stream and remove all presences on it.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
@@ -1300,12 +1373,12 @@ func (n *RuntimeGoNakamaModule) StreamClose(mode uint8, subject, subcontext, lab
 
 // @group streams
 // @summary Send data to presences on a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
 // @param data(type=string) The data to send.
-// @param presences(type=[]runtime.Presence) Array of presences to receive the sent data. If not set, will be sent to all presences.
+// @param presences(type=[]runtime.Presence, optional=true, default=all) Array of presences to receive the sent data.
 // @param reliable(type=bool) Whether the sender has been validated prior.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) StreamSend(mode uint8, subject, subcontext, label, data string, presences []runtime.Presence, reliable bool) error {
@@ -1377,12 +1450,12 @@ func (n *RuntimeGoNakamaModule) StreamSend(mode uint8, subject, subcontext, labe
 
 // @group streams
 // @summary Send a message to presences on a stream.
-// @param mode(type=uint8) The type of stream, 'chat' for example.
+// @param mode(type=uint8) The Type of stream, '2' for a chat channel for example.
 // @param subject(type=string) The primary stream subject, typically a user ID.
 // @param subcontext(type=string) A secondary subject, for example for direct chat between two users.
 // @param label(type=string) Meta-information about the stream, for example a chat room name.
 // @param msg(type=*rtapi.Envelope) The message to send.
-// @param presences(type=[]runtime.Presence) Array of presences to receive the sent data. If not set, will be sent to all presences.
+// @param presences(type=[]runtime.Presence, optional=true, default=all) Array of presences to receive the sent data.
 // @param reliable(type=bool) Whether the sender has been validated prior.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) StreamSendRaw(mode uint8, subject, subcontext, label string, msg *rtapi.Envelope, presences []runtime.Presence, reliable bool) error {
@@ -1456,8 +1529,8 @@ func (n *RuntimeGoNakamaModule) SessionDisconnect(ctx context.Context, sessionID
 // @group sessions
 // @summary Log out a user from their current session.
 // @param userId(type=string) The ID of the user to be logged out.
-// @param token(type=string) The current session authentication token. If the current auth and refresh tokens are not provided, all user sessions will be logged out.
-// @param refreshToken(type=string) The current session refresh token. If the current auth and refresh tokens are not provided, all user sessions will be logged out.
+// @param token(type=string, optional=true) The current session authentication token. If the current auth and refresh tokens are not provided, all user sessions will be logged out.
+// @param refreshToken(type=string, optional=true) The current session refresh token. If the current auth and refresh tokens are not provided, all user sessions will be logged out.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) SessionLogout(userID, token, refreshToken string) error {
 	uid, err := uuid.FromString(userID)
@@ -1501,13 +1574,13 @@ func (n *RuntimeGoNakamaModule) MatchGet(ctx context.Context, id string) (*api.M
 // @group matches
 // @summary List currently running realtime multiplayer matches and optionally filter them by authoritative mode, label, and current participant count.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param limit(type=int1) The maximum number of matches to list.
-// @param authoritative(type=boolfalse) Set true to only return authoritative matches, false to only return relayed matches.
-// @param label(type=string"") A label to filter authoritative matches by. Default "" means any label matches.
+// @param limit(type=int, optional=true, default=100) The maximum number of matches to list.
+// @param authoritative(type=bool, optional=true, default=false) Set true to only return authoritative matches, false to only return relayed matches.
+// @param label(type=string, default="") A label to filter authoritative matches by. Default "" means any label matches.
 // @param minSize(type=int) Inclusive lower limit of current match participants.
 // @param maxSize(type=int) Inclusive upper limit of current match participants.
 // @param query(type=string) Additional query parameters to shortlist matches.
-// @return match(*api.Match) A list of matches matching the parameters criteria.
+// @return match([]*api.Match) A list of matches matching the parameters criteria.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) MatchList(ctx context.Context, limit int, authoritative bool, label string, minSize, maxSize *int, query string) ([]*api.Match, error) {
 	authoritativeWrapper := &wrapperspb.BoolValue{Value: authoritative}
@@ -1550,8 +1623,8 @@ func (n *RuntimeGoNakamaModule) MatchSignal(ctx context.Context, id string, data
 // @param subject(type=string) Notification subject.
 // @param content(type=map[string]interface{}) Notification content. Must be set but can be an struct.
 // @param code(type=int) Notification code to use. Must be equal or greater than 0.
-// @param sender(type=string) The sender of this notification. If left empty, it will be assumed that it is a system notification.
-// @param persistent(type=boolfalse) Whether to record this in the database for later listing.
+// @param sender(type=string, optional=true) The sender of this notification. If left empty, it will be assumed that it is a system notification.
+// @param persistent(type=bool, default=false) Whether to record this in the database for later listing.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) NotificationSend(ctx context.Context, userID, subject string, content map[string]interface{}, code int, sender string, persistent bool) error {
 	uid, err := uuid.FromString(userID)
@@ -1595,13 +1668,13 @@ func (n *RuntimeGoNakamaModule) NotificationSend(ctx context.Context, userID, su
 		uid: nots,
 	}
 
-	return NotificationSend(ctx, n.logger, n.db, n.router, notifications)
+	return NotificationSend(ctx, n.logger, n.db, n.tracker, n.router, notifications)
 }
 
 // @group notifications
 // @summary Send one or more in-app notifications to a user.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param notifications(type=[]*runtime.NotificationsSend) A list of notifications to be sent together.
+// @param notifications(type=[]*runtime.NotificationSend) A list of notifications to be sent together.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) NotificationsSend(ctx context.Context, notifications []*runtime.NotificationSend) error {
 	ns := make(map[uuid.UUID][]*api.Notification)
@@ -1651,7 +1724,7 @@ func (n *RuntimeGoNakamaModule) NotificationsSend(ctx context.Context, notificat
 		ns[uid] = no
 	}
 
-	return NotificationSend(ctx, n.logger, n.db, n.router, ns)
+	return NotificationSend(ctx, n.logger, n.db, n.tracker, n.router, ns)
 }
 
 // @group notifications
@@ -1696,7 +1769,7 @@ func (n *RuntimeGoNakamaModule) NotificationSendAll(ctx context.Context, subject
 // @group notifications
 // @summary Delete one or more in-app notifications.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param notifications(type=[]*runtime.NotificationsDelete) A list of notifications to be deleted.
+// @param notifications(type=[]*runtime.NotificationDelete) A list of notifications to be deleted.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) NotificationsDelete(ctx context.Context, notifications []*runtime.NotificationDelete) error {
 	ns := make(map[uuid.UUID][]string)
@@ -1729,15 +1802,91 @@ func (n *RuntimeGoNakamaModule) NotificationsDelete(ctx context.Context, notific
 	return nil
 }
 
+// @group notifications
+// @summary Get notifications by their id.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userID(type=string) Optional userID to scope results to that user only.
+// @param ids(type=[]string) A list of notification ids.
+// @return notifications([]*api.Notification) A list of notifications.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) NotificationsGetId(ctx context.Context, userID string, ids []string) ([]*runtime.Notification, error) {
+	return NotificationsGetId(ctx, n.logger, n.db, userID, ids...)
+}
+
+// @group notifications
+// @summary List notifications by user id.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userID(type=string) Optional userID to scope results to that user only.
+// @param limit(type=int) Limit number of results. Must be a value between 1 and 1000.
+// @param cursor(type=string) Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @return notifications(*api.NotificationList) A list of notifications.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) NotificationsList(ctx context.Context, userID string, limit int, cursor string) ([]*api.Notification, string, error) {
+	if userID == "" {
+		return nil, "", errors.New("expects a valid user id")
+	}
+
+	if limit < 0 || limit > 1000 {
+		return nil, "", errors.New("expects limit to be 0-100")
+	}
+
+	uid, err := uuid.FromString(userID)
+	if err != nil {
+		return nil, "", errors.New("expects a valid user id")
+	}
+
+	list, err := NotificationList(ctx, n.logger, n.db, uid, limit, cursor, false)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return list.Notifications, list.CacheableCursor, nil
+}
+
+// @group notifications
+// @summary Delete notifications by their id.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userID(type=string) Optional userID to scope deletions to that user only. Use empty string to ignore.
+// @param ids(type=[]string) A list of notification ids.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) NotificationsDeleteId(ctx context.Context, userID string, ids []string) error {
+	return NotificationsDeleteId(ctx, n.logger, n.db, userID, ids...)
+}
+
+// @group notifications
+// @summary Update notifications by their id.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userID(type=[]runtime.NotificationUpdate)
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) NotificationsUpdate(ctx context.Context, updates ...runtime.NotificationUpdate) error {
+	nUpdates := make([]notificationUpdate, 0, len(updates))
+
+	for _, update := range updates {
+		uid, err := uuid.FromString(update.Id)
+		if err != nil {
+			return errors.New("expects id to be a valid UUID")
+		}
+
+		nUpdates = append(nUpdates, notificationUpdate{
+			Id:      uid,
+			Content: update.Content,
+			Subject: update.Subject,
+			Sender:  update.Sender,
+		})
+	}
+
+	return NotificationsUpdate(ctx, n.logger, n.db, nUpdates...)
+}
+
 // @group wallets
 // @summary Update a user's wallet with the given changeset.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The ID of the user whose wallet to update.
 // @param changeset(type=map[string]int64) The set of wallet operations to apply.
 // @param metadata(type=map[string]interface{}) Additional metadata to tag the wallet update with.
-// @param updateLedger(type=boolfalse) Whether to record this update in the ledger.
-// @return updatedValue(type=map) The updated wallet value.
-// @return previousValue(type=map) The previous wallet value.
+// @param updateLedger(type=bool, default=false) Whether to record this update in the ledger.
+// @return updatedValue(map) The updated wallet value.
+// @return previousValue(map) The previous wallet value.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) WalletUpdate(ctx context.Context, userID string, changeset map[string]int64, metadata map[string]interface{}, updateLedger bool) (map[string]int64, map[string]int64, error) {
 	uid, err := uuid.FromString(userID)
@@ -1777,8 +1926,8 @@ func (n *RuntimeGoNakamaModule) WalletUpdate(ctx context.Context, userID string,
 // @summary Update one or more user wallets with individual changesets. This function will also insert a new wallet ledger item into each user's wallet history that tracks their update.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param updates(type=[]*runtime.WalletUpdate) The set of user wallet update operations to apply.
-// @param updateLedger(type=boolfalse) Whether to record this update in the ledger.
-// @return updateWallets(runtime.WallateUpdateResult) A list of wallet update results.
+// @param updateLedger(type=bool, default=false) Whether to record this update in the ledger.
+// @return updateWallets([]runtime.WalletUpdateResult) A list of wallet update results.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) WalletsUpdate(ctx context.Context, updates []*runtime.WalletUpdate, updateLedger bool) ([]*runtime.WalletUpdateResult, error) {
 	size := len(updates)
@@ -1837,8 +1986,8 @@ func (n *RuntimeGoNakamaModule) WalletLedgerUpdate(ctx context.Context, itemID s
 // @summary List all wallet updates for a particular user from oldest to newest.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The ID of the user to list wallet updates for.
-// @param limit(type=int100) Limit number of results.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param limit(type=int, optional=true, default=100) Limit number of results.
+// @param cursor(type=string, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return runtimeItems([]runtime.WalletLedgerItem) A Go slice containing wallet entries with Id, UserId, CreateTime, UpdateTime, Changeset, Metadata parameters.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) WalletLedgerList(ctx context.Context, userID string, limit int, cursor string) ([]runtime.WalletLedgerItem, string, error) {
@@ -1863,17 +2012,85 @@ func (n *RuntimeGoNakamaModule) WalletLedgerList(ctx context.Context, userID str
 	return runtimeItems, newCursor, nil
 }
 
+// @group status
+// @summary Follow a player's status changes on a given session.
+// @param sessionID(type=string) A valid session identifier.
+// @param userIDs(type=[]string) A list of userIDs to follow.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) StatusFollow(sessionID string, userIDs []string) error {
+	suid, err := uuid.FromString(sessionID)
+	if err != nil {
+		return errors.New("expects a valid session id")
+	}
+
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	uids := make(map[uuid.UUID]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		uid, err := uuid.FromString(id)
+		if err != nil {
+			return errors.New("expects a valid user id")
+		}
+		uids[uid] = struct{}{}
+	}
+
+	n.statusRegistry.Follow(suid, uids)
+
+	return nil
+}
+
+// @group status
+// @summary Unfollow a player's status changes on a given session.
+// @param sessionID(type=string) A valid session identifier.
+// @param userIDs(type=[]string) A list of userIDs to unfollow.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) StatusUnfollow(sessionID string, userIDs []string) error {
+	suid, err := uuid.FromString(sessionID)
+	if err != nil {
+		return errors.New("expects a valid session id")
+	}
+
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	uids := make([]uuid.UUID, 0, len(userIDs))
+	for _, id := range userIDs {
+		uid, err := uuid.FromString(id)
+		if err != nil {
+			return errors.New("expects a valid user id")
+		}
+		uids = append(uids, uid)
+	}
+
+	n.statusRegistry.Unfollow(suid, uids)
+
+	return nil
+}
+
 // @group storage
 // @summary List records in a collection and page through results. The records returned can be filtered to those owned by the user or "" for public records.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param userId(type=string) User ID to list records for or "" (empty string) for public records.
 // @param collection(type=string) Collection to list data from.
-// @param limit(type=int100) Limit number of records retrieved.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param limit(type=int, optional=true, default=100) Limit number of records retrieved.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return objects([]*api.StorageObject) A list of storage objects.
 // @return cursor(string) Pagination cursor. Will be set to "" or nil when fetching last available page.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeGoNakamaModule) StorageList(ctx context.Context, userID, collection string, limit int, cursor string) ([]*api.StorageObject, string, error) {
+func (n *RuntimeGoNakamaModule) StorageList(ctx context.Context, callerID, userID, collection string, limit int, cursor string) ([]*api.StorageObject, string, error) {
+	cid := uuid.Nil
+	if callerID != "" {
+		u, err := uuid.FromString(callerID)
+		if err != nil {
+			return nil, "", errors.New("expects an empty or valid caller id")
+		}
+		cid = u
+	}
+
 	var uid *uuid.UUID
 	if userID != "" {
 		u, err := uuid.FromString(userID)
@@ -1887,7 +2104,7 @@ func (n *RuntimeGoNakamaModule) StorageList(ctx context.Context, userID, collect
 		return nil, "", errors.New("limit must not be negative")
 	}
 
-	objectList, _, err := StorageListObjects(ctx, n.logger, n.db, uuid.Nil, uid, collection, limit, cursor)
+	objectList, _, err := StorageListObjects(ctx, n.logger, n.db, cid, uid, collection, limit, cursor)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1898,8 +2115,8 @@ func (n *RuntimeGoNakamaModule) StorageList(ctx context.Context, userID, collect
 // @group storage
 // @summary Fetch one or more records by their bucket/collection/keyname and optional user.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param objectIds(type=[]*runtime.StorageReads) An array of object identifiers to be fetched.
-// @return objects([]*api.StorageObject) A list of matches matching the parameters criteria.
+// @param objectIds(type=[]*runtime.StorageRead) An array of object identifiers to be fetched.
+// @return objects([]*api.StorageObject) A list of storage objects matching the parameters criteria.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) StorageRead(ctx context.Context, reads []*runtime.StorageRead) ([]*api.StorageObject, error) {
 	size := len(reads)
@@ -1943,7 +2160,7 @@ func (n *RuntimeGoNakamaModule) StorageRead(ctx context.Context, reads []*runtim
 // @summary Write one or more objects by their collection/keyname and optional user.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param objectIds(type=[]*runtime.StorageWrite) An array of object identifiers to be written.
-// @return acks([]*api.StorageObjectAcks) A list of acks with the version of the written objects.
+// @return acks([]*api.StorageObjectAck) A list of acks with the version of the written objects.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) StorageWrite(ctx context.Context, writes []*runtime.StorageWrite) ([]*api.StorageObjectAck, error) {
 	size := len(writes)
@@ -1988,7 +2205,7 @@ func (n *RuntimeGoNakamaModule) StorageWrite(ctx context.Context, writes []*runt
 		ops = append(ops, op)
 	}
 
-	acks, _, err := StorageWriteObjects(ctx, n.logger, n.db, n.metrics, true, ops)
+	acks, _, err := StorageWriteObjects(ctx, n.logger, n.db, n.metrics, n.storageIndex, true, ops)
 	if err != nil {
 		return nil, err
 	}
@@ -2038,9 +2255,41 @@ func (n *RuntimeGoNakamaModule) StorageDelete(ctx context.Context, deletes []*ru
 		ops = append(ops, op)
 	}
 
-	_, err := StorageDeleteObjects(ctx, n.logger, n.db, true, ops)
+	_, err := StorageDeleteObjects(ctx, n.logger, n.db, n.storageIndex, true, ops)
 
 	return err
+}
+
+// @group storage
+// @summary List storage index entries
+// @param indexName(type=string) Name of the index to list entries from.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty, defaults to system user and permissions are bypassed.
+// @param queryString(type=string) Query to filter index entries.
+// @param limit(type=int) Maximum number of results to be returned.
+// @param order(type=[]string, optional=true) The storage object fields to sort the query results by. The prefix '-' before a field name indicates descending order. All specified fields must be indexed and sortable.
+// @param cursor(type=string) A cursor to fetch the next page of results.
+// @return objects(*api.StorageObjectList) A list of storage objects.
+// @return cursor(type=string) An optional cursor that can be used to retrieve the next page of records (if any).
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) StorageIndexList(ctx context.Context, callerID, indexName, query string, limit int, order []string, cursor string) (*api.StorageObjects, string, error) {
+	cid := uuid.Nil
+	if callerID != "" {
+		id, err := uuid.FromString(callerID)
+		if err != nil {
+			return nil, "", errors.New("expects caller id to be empty or a valid user id")
+		}
+		cid = id
+	}
+
+	if indexName == "" {
+		return nil, "", errors.New("expects a non-empty indexName")
+	}
+
+	if limit < 1 || limit > 10_000 {
+		return nil, "", errors.New("limit must be 1-10000")
+	}
+
+	return n.storageIndex.List(ctx, cid, indexName, query, limit, order, cursor)
 }
 
 // @group users
@@ -2048,12 +2297,13 @@ func (n *RuntimeGoNakamaModule) StorageDelete(ctx context.Context, deletes []*ru
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param accountUpdates(type=[]*runtime.AccountUpdate) Array of account information to be updated.
 // @param storageWrites(type=[]*runtime.StorageWrite) Array of storage objects to be updated.
+// @param storageDeletes(type=[]*runtime.StorageDelete) Array of storage objects to be deleted.
 // @param walletUpdates(type=[]*runtime.WalletUpdate) Array of wallet updates to be made.
-// @param updateLedger(type=boolfalse) Whether to record this wallet update in the ledger.
+// @param updateLedger(type=bool, optional=true, default=false) Whether to record this wallet update in the ledger.
 // @return storageWriteOps([]*api.StorageObjectAck) A list of acks with the version of the written objects.
-// @return walletUpdateOps(*runtime.WalletUpdateResult) A list of wallet updates results.
+// @return walletUpdateOps([]*runtime.WalletUpdateResult) A list of wallet updates results.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeGoNakamaModule) MultiUpdate(ctx context.Context, accountUpdates []*runtime.AccountUpdate, storageWrites []*runtime.StorageWrite, walletUpdates []*runtime.WalletUpdate, updateLedger bool) ([]*api.StorageObjectAck, []*runtime.WalletUpdateResult, error) {
+func (n *RuntimeGoNakamaModule) MultiUpdate(ctx context.Context, accountUpdates []*runtime.AccountUpdate, storageWrites []*runtime.StorageWrite, storageDeletes []*runtime.StorageDelete, walletUpdates []*runtime.WalletUpdate, updateLedger bool) ([]*api.StorageObjectAck, []*runtime.WalletUpdateResult, error) {
 	// Process account update inputs.
 	accountUpdateOps := make([]*accountUpdate, 0, len(accountUpdates))
 	for _, update := range accountUpdates {
@@ -2141,6 +2391,37 @@ func (n *RuntimeGoNakamaModule) MultiUpdate(ctx context.Context, accountUpdates 
 		storageWriteOps = append(storageWriteOps, op)
 	}
 
+	// Process storage delete inputs.
+	storageDeleteOps := make(StorageOpDeletes, 0, len(storageDeletes))
+	for _, del := range storageDeletes {
+		if del.Collection == "" {
+			return nil, nil, errors.New("expects collection to be a non-empty string")
+		}
+		if del.Key == "" {
+			return nil, nil, errors.New("expects key to be a non-empty string")
+		}
+		if del.UserID != "" {
+			if _, err := uuid.FromString(del.UserID); err != nil {
+				return nil, nil, errors.New("expects an empty or valid user id")
+			}
+		}
+
+		op := &StorageOpDelete{
+			ObjectID: &api.DeleteStorageObjectId{
+				Collection: del.Collection,
+				Key:        del.Key,
+				Version:    del.Version,
+			},
+		}
+		if del.UserID == "" {
+			op.OwnerID = uuid.Nil.String()
+		} else {
+			op.OwnerID = del.UserID
+		}
+
+		storageDeleteOps = append(storageDeleteOps, op)
+	}
+
 	// Process wallet update inputs.
 	walletUpdateOps := make([]*walletUpdate, len(walletUpdates))
 	for i, update := range walletUpdates {
@@ -2164,25 +2445,26 @@ func (n *RuntimeGoNakamaModule) MultiUpdate(ctx context.Context, accountUpdates 
 		}
 	}
 
-	return MultiUpdate(ctx, n.logger, n.db, n.metrics, accountUpdateOps, storageWriteOps, walletUpdateOps, updateLedger)
+	return MultiUpdate(ctx, n.logger, n.db, n.metrics, accountUpdateOps, storageWriteOps, storageDeleteOps, n.storageIndex, walletUpdateOps, updateLedger)
 }
 
 // @group leaderboards
 // @summary Setup a new dynamic leaderboard with the specified ID and various configuration settings. The leaderboard will be created if it doesn't already exist, otherwise its configuration will not be updated.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param leaderboardID(type=string) The unique identifier for the new leaderboard. This is used by clients to submit scores.
-// @param authoritative(type=boolfalse) Mark the leaderboard as authoritative which ensures updates can only be made via the Go runtime. No client can submit a score directly.
-// @param sortOrder(type=string"desc") The sort order for records in the leaderboard. Possible values are "asc" or "desc".
-// @param operator(type=string"best") The operator that determines how scores behave when submitted. Possible values are "best", "set", or "incr".
+// @param authoritative(type=bool, default=false) Mark the leaderboard as authoritative which ensures updates can only be made via the Go runtime. No client can submit a score directly.
+// @param sortOrder(type=string, default="desc") The sort order for records in the leaderboard. Possible values are "asc" or "desc".
+// @param operator(type=string, default="best") The operator that determines how scores behave when submitted. Possible values are "best", "set", or "incr".
 // @param resetSchedule(type=string) The cron format used to define the reset schedule for the leaderboard. This controls when a leaderboard is reset and can be used to power daily/weekly/monthly leaderboards.
 // @param metadata(type=map[string]interface{}) The metadata you want associated to the leaderboard. Some good examples are weather conditions for a racing game.
+// @param enableRanks(type=bool) Whether to enable rank values for the leaderboard.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeGoNakamaModule) LeaderboardCreate(ctx context.Context, id string, authoritative bool, sortOrder, operator, resetSchedule string, metadata map[string]interface{}) error {
+func (n *RuntimeGoNakamaModule) LeaderboardCreate(ctx context.Context, id string, authoritative bool, sortOrder, operator, resetSchedule string, metadata map[string]interface{}, enableRanks bool) error {
 	if id == "" {
 		return errors.New("expects a leaderboard ID string")
 	}
 
-	sort := LeaderboardSortOrderDescending
+	sort := LeaderboardSortOrderDescending //nolint:ineffassign
 	switch sortOrder {
 	case "desc", "descending":
 		sort = LeaderboardSortOrderDescending
@@ -2192,7 +2474,7 @@ func (n *RuntimeGoNakamaModule) LeaderboardCreate(ctx context.Context, id string
 		return errors.New("expects sort order to be 'asc' or 'desc'")
 	}
 
-	oper := LeaderboardOperatorBest
+	oper := LeaderboardOperatorBest //nolint:ineffassign
 	switch operator {
 	case "best":
 		oper = LeaderboardOperatorBest
@@ -2221,12 +2503,15 @@ func (n *RuntimeGoNakamaModule) LeaderboardCreate(ctx context.Context, id string
 		metadataStr = string(metadataBytes)
 	}
 
-	_, err := n.leaderboardCache.Create(ctx, id, authoritative, sort, oper, resetSchedule, metadataStr)
+	_, created, err := n.leaderboardCache.Create(ctx, id, authoritative, sort, oper, resetSchedule, metadataStr, enableRanks)
 	if err != nil {
 		return err
 	}
 
-	n.leaderboardScheduler.Update()
+	if created {
+		// Only need to update the scheduler for newly created leaderboards.
+		n.leaderboardScheduler.Update()
+	}
 
 	return nil
 }
@@ -2241,25 +2526,21 @@ func (n *RuntimeGoNakamaModule) LeaderboardDelete(ctx context.Context, id string
 		return errors.New("expects a leaderboard ID string")
 	}
 
-	return n.leaderboardCache.Delete(ctx, n.leaderboardRankCache, n.leaderboardScheduler, id)
+	_, err := n.leaderboardCache.Delete(ctx, n.leaderboardRankCache, n.leaderboardScheduler, id)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // @group leaderboards
 // @summary Find leaderboards which have been created on the server. Leaderboards can be filtered with categories.
-// @param categoryStart(type=int) Filter leaderboards with categories greater or equal than this value.
-// @param categoryEnd(type=int) Filter leaderboards with categories equal or less than this value.
 // @param limit(type=int) Return only the required number of leaderboards denoted by this limit value.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return leaderboardList(*api.LeaderboardList) A list of leaderboard results and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeGoNakamaModule) LeaderboardList(categoryStart, categoryEnd, limit int, cursor string) (*api.LeaderboardList, error) {
-	if categoryStart < 0 || categoryStart >= 128 {
-		return nil, errors.New("categoryStart must be 0-127")
-	}
-	if categoryEnd < 0 || categoryEnd >= 128 {
-		return nil, errors.New("categoryEnd must be 0-127")
-	}
-
+func (n *RuntimeGoNakamaModule) LeaderboardList(limit int, cursor string) (*api.LeaderboardList, error) {
 	if limit < 1 || limit > 100 {
 		return nil, errors.New("limit must be 1-100")
 	}
@@ -2276,7 +2557,16 @@ func (n *RuntimeGoNakamaModule) LeaderboardList(categoryStart, categoryEnd, limi
 		}
 	}
 
-	return LeaderboardList(n.logger, n.leaderboardCache, categoryStart, categoryEnd, limit, cursorPtr)
+	return LeaderboardList(n.logger, n.leaderboardCache, limit, cursorPtr)
+}
+
+// @group leaderboards
+// @summary Disable a leaderboard rank cache freeing its allocated resources. If already disabled is a NOOP.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param id(type=string) The leaderboard id.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) LeaderboardRanksDisable(ctx context.Context, id string) error {
+	return DisableTournamentRanks(ctx, n.logger, n.db, n.leaderboardCache, n.leaderboardRankCache, id)
 }
 
 // @group leaderboards
@@ -2285,10 +2575,10 @@ func (n *RuntimeGoNakamaModule) LeaderboardList(categoryStart, categoryEnd, limi
 // @param id(type=string) The unique identifier for the leaderboard to list.
 // @param owners(type=[]string) Array of owners to filter to.
 // @param limit(type=int) The maximum number of records to return (Max 10,000).
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @param overrideExpiry(type=int) Records with expiry in the past are not returned unless within this defined limit. Must be equal or greater than 0.
-// @return records(*api.LeaderboardRecord) A page of leaderboard records.
-// @return ownerRecords(*api.LeaderboardRecord) A list of owner leaderboard records (empty if the owners input parameter is not set).
+// @return records([]*api.LeaderboardRecord) A page of leaderboard records.
+// @return ownerRecords([]*api.LeaderboardRecord) A list of owner leaderboard records (empty if the owners input parameter is not set).
 // @return nextCursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any).
 // @return prevCursor(string) An optional previous page cursor that can be used to retrieve the previous page of records (if any).
 // @return error(error) An optional error value if an error occurred.
@@ -2323,14 +2613,72 @@ func (n *RuntimeGoNakamaModule) LeaderboardRecordsList(ctx context.Context, id s
 }
 
 // @group leaderboards
+// @summary Build a cursor to be used with leaderboardRecordsList to fetch records starting at a given rank. Only available if rank cache is not disabled for the leaderboard.
+// @param leaderboardID(type=string) The unique identifier of the leaderboard.
+// @param rank(type=int64) The rank to start listing leaderboard records from.
+// @param overrideExpiry(type=int64) Records with expiry in the past are not returned unless within this defined limit. Must be equal or greater than 0.
+// @return leaderboardListCursor(string) A string cursor to be used with leaderboardRecordsList.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) LeaderboardRecordsListCursorFromRank(id string, rank, expiry int64) (string, error) {
+	if id == "" {
+		return "", errors.New("invalid leaderboard id")
+	}
+
+	if rank < 1 {
+		return "", errors.New("invalid rank - must be > 1")
+	}
+
+	if expiry < 0 {
+		return "", errors.New("expects expiry to equal or greater than 0")
+	}
+
+	l := n.leaderboardCache.Get(id)
+	if l == nil {
+		return "", ErrLeaderboardNotFound
+	}
+
+	expiryTime, ok := calculateExpiryOverride(expiry, l)
+	if !ok {
+		return "", errors.New("invalid expiry")
+	}
+
+	rank-- // Fetch previous entry to include requested rank in the results
+	if rank == 0 {
+		return "", nil
+	}
+
+	ownerId, score, subscore, err := n.leaderboardRankCache.GetDataByRank(id, expiryTime, l.SortOrder, rank)
+	if err != nil {
+		return "", fmt.Errorf("failed to get cursor from rank: %s", err.Error())
+	}
+
+	cursor := &leaderboardRecordListCursor{
+		IsNext:        true,
+		LeaderboardId: id,
+		ExpiryTime:    expiryTime,
+		Score:         score,
+		Subscore:      subscore,
+		OwnerId:       ownerId.String(),
+		Rank:          rank,
+	}
+
+	cursorStr, err := marshalLeaderboardRecordsListCursor(cursor)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal leaderboard cursor: %s", err.Error())
+	}
+
+	return cursorStr, nil
+}
+
+// @group leaderboards
 // @summary Use the preconfigured operator for the given leaderboard to submit a score for a particular user.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) The unique identifier for the leaderboard to submit to.
 // @param owner(type=string) The owner of this score submission.
 // @param username(type=string) The owner username of this score submission, if it's a user.
-// @param score(type=int640) The score to submit.
-// @param subscore(type=int640) A secondary subscore parameter for the submission.
-// @param metadata(type=map[string]interface{}) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
+// @param score(type=int64) The score to submit.
+// @param subscore(type=int64, optional=true) A secondary subscore parameter for the submission.
+// @param metadata(type=map[string]interface{}, optional=true) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
 // @param overrideOperator(type=*int) An override operator for the new record. The accepted values include: 0 (no override), 1 (best), 2 (set), 3 (incr), 4 (decr). Passing nil is the same as passing a pointer to 0 (no override), which uses the default leaderboard operator.
 // @return record(*api.LeaderboardRecord) The newly created leaderboard record.
 // @return error(error) An optional error value if an error occurred.
@@ -2396,7 +2744,7 @@ func (n *RuntimeGoNakamaModule) LeaderboardRecordDelete(ctx context.Context, id,
 // @param id(type=string) The ID of the leaderboard to list records for.
 // @param ownerId(type=string) The owner ID around which to show records.
 // @param limit(type=int) Return only the required number of leaderboard records denoted by this limit value. Between 1-100.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @param expiry(type=int64) Time since epoch in seconds. Must be greater than 0.
 // @return leaderboardRecordsHaystack(*api.LeaderboardRecordList) A list of leaderboard records and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
@@ -2424,7 +2772,7 @@ func (n *RuntimeGoNakamaModule) LeaderboardRecordsHaystack(ctx context.Context, 
 // @group leaderboards
 // @summary Fetch one or more leaderboards by ID.
 // @param ids(type=[]string) The table array of leaderboard ids.
-// @return leaderboardsGet(*api.Leaderboard) The leaderboard records according to ID.
+// @return leaderboardsGet([]*api.Leaderboard) The leaderboard records according to ID.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) LeaderboardsGetId(ctx context.Context, IDs []string) ([]*api.Leaderboard, error) {
 	return LeaderboardsGet(n.leaderboardCache, IDs), nil
@@ -2435,26 +2783,27 @@ func (n *RuntimeGoNakamaModule) LeaderboardsGetId(ctx context.Context, IDs []str
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) The unique identifier for the new tournament. This is used by clients to submit scores.
 // @param authoritative(type=bool) Whether the tournament created is server authoritative.
-// @param sortOrder(type=string"desc") The sort order for records in the tournament. Possible values are "asc" or "desc".
-// @param operator(type=string"best") The operator that determines how scores behave when submitted. The possible values are "best", "set", or "incr".
+// @param sortOrder(type=string, default="desc") The sort order for records in the tournament. Possible values are "asc" or "desc".
+// @param operator(type=string, default="best") The operator that determines how scores behave when submitted. The possible values are "best", "set", or "incr".
 // @param resetSchedule(type=string) The cron format used to define the reset schedule for the tournament. This controls when the underlying leaderboard resets and the tournament is considered active again.
 // @param metadata(type=map[string]interface{}) The metadata you want associated to the tournament. Some good examples are weather conditions for a racing game.
 // @param title(type=string) The title of the tournament.
 // @param description(type=string) The description of the tournament.
 // @param category(type=int) A category associated with the tournament. This can be used to filter different types of tournaments. Between 0 and 127.
-// @param startTime(type=int) The start time of the tournament. Leave empty for immediately or a future time.
-// @param endTime(type=intnever) The end time of the tournament. When the end time is elapsed, the tournament will not reset and will cease to exist. Must be greater than startTime if set.
+// @param startTime(type=int, optional=true) The start time of the tournament. Leave empty for immediately or a future time.
+// @param endTime(type=int, optional=true, default=never) The end time of the tournament. When the end time is elapsed, the tournament will not reset and will cease to exist. Must be greater than startTime if set.
 // @param duration(type=int) The active duration for a tournament. This is the duration when clients are able to submit new records. The duration starts from either the reset period or tournament start time, whichever is sooner. A game client can query the tournament for results between end of duration and next reset period.
 // @param maxSize(type=int) Maximum size of participants in a tournament.
-// @param maxNumScore(type=int1000000) Maximum submission attempts for a tournament record.
-// @param joinRequired(type=boolfalse) Whether the tournament needs to be joined before a record write is allowed.
+// @param maxNumScore(type=int, default=1000000) Maximum submission attempts for a tournament record.
+// @param joinRequired(type=bool, default=false) Whether the tournament needs to be joined before a record write is allowed.
+// @param enableRanks(type=bool) Whether to enable rank values for the tournament.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeGoNakamaModule) TournamentCreate(ctx context.Context, id string, authoritative bool, sortOrder, operator, resetSchedule string, metadata map[string]interface{}, title, description string, category, startTime, endTime, duration, maxSize, maxNumScore int, joinRequired bool) error {
+func (n *RuntimeGoNakamaModule) TournamentCreate(ctx context.Context, id string, authoritative bool, sortOrder, operator, resetSchedule string, metadata map[string]interface{}, title, description string, category, startTime, endTime, duration, maxSize, maxNumScore int, joinRequired, enableRanks bool) error {
 	if id == "" {
 		return errors.New("expects a tournament ID string")
 	}
 
-	sort := LeaderboardSortOrderDescending
+	sort := LeaderboardSortOrderDescending //nolint:ineffassign
 	switch sortOrder {
 	case "desc", "descending":
 		sort = LeaderboardSortOrderDescending
@@ -2464,7 +2813,7 @@ func (n *RuntimeGoNakamaModule) TournamentCreate(ctx context.Context, id string,
 		return errors.New("expects sort order to be 'asc' or 'desc'")
 	}
 
-	oper := LeaderboardOperatorBest
+	oper := LeaderboardOperatorBest //nolint:ineffassign
 	switch operator {
 	case "best":
 		oper = LeaderboardOperatorBest
@@ -2475,7 +2824,7 @@ func (n *RuntimeGoNakamaModule) TournamentCreate(ctx context.Context, id string,
 	case "decr", "decrement":
 		oper = LeaderboardOperatorDecrement
 	default:
-		return errors.New("expects sort order to be 'best', 'set', 'incr' or 'decr'")
+		return errors.New("expects operator to be 'best', 'set', 'incr' or 'decr'")
 	}
 
 	if resetSchedule != "" {
@@ -2515,7 +2864,7 @@ func (n *RuntimeGoNakamaModule) TournamentCreate(ctx context.Context, id string,
 		return errors.New("maxNumScore must be >= 0")
 	}
 
-	return TournamentCreate(ctx, n.logger, n.leaderboardCache, n.leaderboardScheduler, id, authoritative, sort, oper, resetSchedule, metadataStr, title, description, category, startTime, endTime, duration, maxSize, maxNumScore, joinRequired)
+	return TournamentCreate(ctx, n.logger, n.leaderboardCache, n.leaderboardScheduler, id, authoritative, sort, oper, resetSchedule, metadataStr, title, description, category, startTime, endTime, duration, maxSize, maxNumScore, joinRequired, enableRanks)
 }
 
 // @group tournaments
@@ -2600,12 +2949,12 @@ func (n *RuntimeGoNakamaModule) TournamentsGetId(ctx context.Context, tournament
 // @group tournaments
 // @summary Find tournaments which have been created on the server. Tournaments can be filtered with categories and via start and end times.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param categoryStart(type=int) Filter tournament with categories greater or equal than this value.
-// @param categoryEnd(type=int) Filter tournament with categories equal or less than this value.
-// @param startTime(type=int) Filter tournament with that start after this time.
-// @param endTime(type=int) Filter tournament with that end before this time.
-// @param limit(type=int10) Return only the required number of tournament denoted by this limit value.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param categoryStart(type=int) Filter tournaments with categories greater or equal than this value.
+// @param categoryEnd(type=int) Filter tournaments with categories equal or less than this value.
+// @param startTime(type=int) Filter tournaments that start after this time.
+// @param endTime(type=int) Filter tournaments that end before this time.
+// @param limit(type=int, default=10) Return only the required number of tournament denoted by this limit value.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return tournamentList([]*api.TournamentList) A list of tournament results and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) TournamentList(ctx context.Context, categoryStart, categoryEnd, startTime, endTime, limit int, cursor string) (*api.TournamentList, error) {
@@ -2615,11 +2964,11 @@ func (n *RuntimeGoNakamaModule) TournamentList(ctx context.Context, categoryStar
 	if categoryEnd < 0 || categoryEnd >= 128 {
 		return nil, errors.New("categoryEnd must be 0-127")
 	}
-	if startTime < 0 {
-		return nil, errors.New("startTime must be >= 0")
+	if startTime < -1 {
+		return nil, errors.New("startTime must be >= -1")
 	}
-	if endTime < 0 {
-		return nil, errors.New("endTime must be >= 0")
+	if endTime < -1 {
+		return nil, errors.New("endTime must be >= -1")
 	}
 	if endTime < startTime {
 		return nil, errors.New("endTime must be >= startTime")
@@ -2645,15 +2994,24 @@ func (n *RuntimeGoNakamaModule) TournamentList(ctx context.Context, categoryStar
 }
 
 // @group tournaments
+// @summary Disable a tournament rank cache freeing its allocated resources. If already disabled is a NOOP.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param id(type=string) The tournament id.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) TournamentRanksDisable(ctx context.Context, id string) error {
+	return DisableTournamentRanks(ctx, n.logger, n.db, n.leaderboardCache, n.leaderboardRankCache, id)
+}
+
+// @group tournaments
 // @summary List records on the specified tournament, optionally filtering to only a subset of records by their owners. Records will be listed in the preconfigured tournament sort order.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param tournamentId(type=string) The ID of the tournament to list records for.
 // @param ownerIds(type=[]string) Array of owner IDs to filter results by.
 // @param limit(type=int) Return only the required number of tournament records denoted by this limit value. Max is 10000.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @param overrideExpiry(type=int64) Records with expiry in the past are not returned unless within this defined limit. Must be equal or greater than 0.
-// @return records(*api.LeaderboardRecord) A page of tournament records.
-// @return ownerRecords(*api.LeaderboardRecord) A list of owner tournament records (empty if the owners input parameter is not set).
+// @return records([]*api.LeaderboardRecord) A page of tournament records.
+// @return ownerRecords([]*api.LeaderboardRecord) A list of owner tournament records (empty if the owners input parameter is not set).
 // @return prevCursor(string) An optional previous page cursor that can be used to retrieve the previous page of records (if any).
 // @return nextCursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any).
 // @return error(error) An optional error value if an error occurred.
@@ -2691,9 +3049,10 @@ func (n *RuntimeGoNakamaModule) TournamentRecordsList(ctx context.Context, tourn
 // @param id(type=string) The unique identifier for the tournament leaderboard to submit to.
 // @param owner(type=string) The owner of this score submission.
 // @param username(type=string) The owner username of this score submission, if it's a user.
-// @param score(type=int640) The score to submit.
-// @param subscore(type=int640) A secondary subscore parameter for the submission.
-// @param metadata(type=map[string]interface{}) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
+// @param score(type=int64) The score to submit.
+// @param subscore(type=int64, optional=true) A secondary subscore parameter for the submission.
+// @param metadata(type=map[string]interface{}, optional=true) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
+// @param overrideOperator(type=*int) An override operator for the new record. The accepted values include: 0 (no override), 1 (best), 2 (set), 3 (incr), 4 (decr). Passing nil is the same as passing a pointer to 0 (no override), which uses the default leaderboard operator.
 // @return result(*api.LeaderboardRecord) The newly created leaderboard record.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) TournamentRecordWrite(ctx context.Context, id, ownerID, username string, score, subscore int64, metadata map[string]interface{}, overrideOperator *int) (*api.LeaderboardRecord, error) {
@@ -2752,9 +3111,9 @@ func (n *RuntimeGoNakamaModule) TournamentRecordDelete(ctx context.Context, id, 
 // @param id(type=string) The ID of the tournament to list records for.
 // @param ownerId(type=string) The owner ID around which to show records.
 // @param limit(type=int) Return only the required number of tournament records denoted by this limit value. Between 1-100.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @param expiry(type=int64) Time since epoch in seconds. Must be greater than 0.
-// @return tournamentRecordsHaystack(*api.LeaderboardRecordList) A list of tournament records and possibly a cursor. If cursor is empty/nil there are no further results.
+// @return tournamentRecordsHaystack(*api.TournamentRecordList) A list of tournament records and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) TournamentRecordsHaystack(ctx context.Context, id, ownerID string, limit int, cursor string, expiry int64) (*api.TournamentRecordList, error) {
 	if id == "" {
@@ -2905,11 +3264,41 @@ func (n *RuntimeGoNakamaModule) PurchaseValidateHuawei(ctx context.Context, user
 }
 
 // @group purchases
+// @summary Validates and stores a purchase receipt from Facebook Instant Games.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userId(type=string) The user ID of the owner of the receipt.
+// @param signedRequest(type=string) The Facebook Instant signedRequest receipt data.
+// @param persist(type=bool) Persist the purchase so that seenBefore can be computed to protect against replay attacks.
+// @return validation(*api.ValidatePurchaseResponse) The resulting successfully validated purchases. Any previously validated purchases are returned with a seenBefore flag.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) PurchaseValidateFacebookInstant(ctx context.Context, userID, signedRequest string, persist bool) (*api.ValidatePurchaseResponse, error) {
+	if n.config.GetIAP().FacebookInstant.AppSecret == "" {
+		return nil, errors.New("facebook instant IAP is not configured")
+	}
+
+	uid, err := uuid.FromString(userID)
+	if err != nil {
+		return nil, errors.New("user ID must be a valid id string")
+	}
+
+	if len(signedRequest) < 1 {
+		return nil, errors.New("signedRequest cannot be empty string")
+	}
+
+	validation, err := ValidatePurchaseFacebookInstant(ctx, n.logger, n.db, uid, n.config.GetIAP().FacebookInstant, signedRequest, persist)
+	if err != nil {
+		return nil, err
+	}
+
+	return validation, nil
+}
+
+// @group purchases
 // @summary List stored validated purchase receipts.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) Filter by user ID. Can be an empty string to list purchases for all users.
-// @param limit(type=int) Limit number of records retrieved. Defaults to 100.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param limit(type=int, optional=true, default=100) Limit number of records retrieved.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return listPurchases(*api.PurchaseList) A page of stored validated purchases and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) PurchasesList(ctx context.Context, userID string, limit int, cursor string) (*api.PurchaseList, error) {
@@ -2937,7 +3326,7 @@ func (n *RuntimeGoNakamaModule) PurchaseGetByTransactionId(ctx context.Context, 
 		return nil, errors.New("expects a transaction id string.")
 	}
 
-	return GetPurchaseByTransactionId(ctx, n.db, transactionID)
+	return GetPurchaseByTransactionId(ctx, n.logger, n.db, transactionID)
 }
 
 // @group subscriptions
@@ -2984,7 +3373,7 @@ func (n *RuntimeGoNakamaModule) SubscriptionValidateApple(ctx context.Context, u
 // @param receipt(type=string) JSON encoded Google receipt.
 // @param persist(type=bool) Persist the subscription.
 // @param overrides(type=string, optional=true) Override the iap.google.client_email and iap.google.private_key provided in your configuration.
-// @return validation(*api.ValidatePurchaseResponse) The resulting successfully validated subscription.
+// @return validation(*api.ValidateSubscriptionResponse) The resulting successfully validated subscription.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) SubscriptionValidateGoogle(ctx context.Context, userID, receipt string, persist bool, overrides ...struct {
 	ClientEmail string
@@ -3034,8 +3423,8 @@ func (n *RuntimeGoNakamaModule) SubscriptionValidateGoogle(ctx context.Context, 
 // @summary List stored validated subscriptions.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) Filter by user ID. Can be an empty string to list purchases for all users.
-// @param limit(type=int) Limit number of records retrieved. Defaults to 100.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param limit(type=int, optional=true, default=100) Limit number of records retrieved.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return listSubscriptions(*api.SubscriptionList) A page of stored validated subscriptions and possibly a cursor. If cursor is empty/nil there are no further results.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) SubscriptionsList(ctx context.Context, userID string, limit int, cursor string) (*api.SubscriptionList, error) {
@@ -3096,13 +3485,13 @@ func (n *RuntimeGoNakamaModule) GroupsGetId(ctx context.Context, groupIDs []stri
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The user ID to be associated as the group superadmin.
 // @param name(type=string) Group name, must be unique.
-// @param creatorId(type=string) The user ID to be associated as creator. If not set or nil/null, system user will be set.
-// @param langTag(type=string"en") Group language.
-// @param description(type=string) Group description, can be left empty as nil/null.
-// @param avatarUrl(type=string) URL to the group avatar, can be left empty as nil/null.
-// @param open(type=boolfalse) Whether the group is for anyone to join, or members will need to send invitations to join.
-// @param metadata(type=map[string]interface{}) Custom information to store for this group. Can be left empty as nil/null.
-// @param maxCount(type=int100) Maximum number of members to have in the group.
+// @param creatorId(type=string, optional=true) The user ID to be associated as creator. If not set or nil/null, system user will be set.
+// @param langTag(type=string, optional=true, default="en") Group language.
+// @param description(type=string, optional=true) Group description, can be left empty as nil/null.
+// @param avatarUrl(type=string, optional=true) URL to the group avatar, can be left empty as nil/null.
+// @param open(type=bool, optional=true, default=false) Whether the group is for anyone to join, or members will need to send invitations to join.
+// @param metadata(type=map[string]interface{}, optional=true) Custom information to store for this group. Can be left empty as nil/null.
+// @param maxCount(type=int, default=100) Maximum number of members to have in the group.
 // @return createGroup(*api.Group) The groupId of the newly created group.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) GroupCreate(ctx context.Context, userID, name, creatorID, langTag, description, avatarUrl string, open bool, metadata map[string]interface{}, maxCount int) (*api.Group, error) {
@@ -3223,7 +3612,7 @@ func (n *RuntimeGoNakamaModule) GroupDelete(ctx context.Context, id string) erro
 		return errors.New("expects group ID to be a valid identifier")
 	}
 
-	return DeleteGroup(ctx, n.logger, n.db, groupID, uuid.Nil)
+	return DeleteGroup(ctx, n.logger, n.db, n.tracker, groupID, uuid.Nil)
 }
 
 // @group groups
@@ -3248,7 +3637,7 @@ func (n *RuntimeGoNakamaModule) GroupUserJoin(ctx context.Context, groupID, user
 		return errors.New("expects a username string")
 	}
 
-	return JoinGroup(ctx, n.logger, n.db, n.router, group, user, username)
+	return JoinGroup(ctx, n.logger, n.db, n.tracker, n.router, group, user, username)
 }
 
 // @group groups
@@ -3279,6 +3668,7 @@ func (n *RuntimeGoNakamaModule) GroupUserLeave(ctx context.Context, groupID, use
 // @group groups
 // @summary Add users to a group.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param groupId(type=string) The ID of the group to add users to.
 // @param userIds(type=[]string) Table array of user IDs to add to this group.
 // @return error(error) An optional error value if an error occurred.
@@ -3287,7 +3677,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersAdd(ctx context.Context, callerID, gro
 	if callerID != "" {
 		var err error
 		if caller, err = uuid.FromString(callerID); err != nil {
-			return errors.New("expects caller ID to be a valid identifier")
+			return errors.New("expects caller ID to be empty or a valid identifier")
 		}
 	}
 
@@ -3312,12 +3702,13 @@ func (n *RuntimeGoNakamaModule) GroupUsersAdd(ctx context.Context, callerID, gro
 		users = append(users, uid)
 	}
 
-	return AddGroupUsers(ctx, n.logger, n.db, n.router, caller, group, users)
+	return AddGroupUsers(ctx, n.logger, n.db, n.tracker, n.router, caller, group, users)
 }
 
 // @group groups
 // @summary Ban users from a group.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param groupId(type=string) The ID of the group to ban users from.
 // @param userIds(type=[]string) Table array of user IDs to ban from this group.
 // @return error(error) An optional error value if an error occurred.
@@ -3326,7 +3717,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersBan(ctx context.Context, callerID, gro
 	if callerID != "" {
 		var err error
 		if caller, err = uuid.FromString(callerID); err != nil {
-			return errors.New("expects caller ID to be a valid identifier")
+			return errors.New("expects caller ID to be empty or a valid identifier")
 		}
 	}
 
@@ -3357,6 +3748,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersBan(ctx context.Context, callerID, gro
 // @group groups
 // @summary Kick users from a group.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param groupId(type=string) The ID of the group to kick users from.
 // @param userIds(type=[]string) Table array of user IDs to kick.
 // @return error(error) An optional error value if an error occurred.
@@ -3365,7 +3757,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersKick(ctx context.Context, callerID, gr
 	if callerID != "" {
 		var err error
 		if caller, err = uuid.FromString(callerID); err != nil {
-			return errors.New("expects caller ID to be a valid identifier")
+			return errors.New("expects caller ID to be empty or a valid identifier")
 		}
 	}
 
@@ -3396,6 +3788,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersKick(ctx context.Context, callerID, gr
 // @group groups
 // @summary Promote users in a group.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param groupId(type=string) The ID of the group whose members are being promoted.
 // @param userIds(type=[]string) Table array of user IDs to promote.
 // @return error(error) An optional error value if an error occurred.
@@ -3404,7 +3797,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersPromote(ctx context.Context, callerID,
 	if callerID != "" {
 		var err error
 		if caller, err = uuid.FromString(callerID); err != nil {
-			return errors.New("expects caller ID to be a valid identifier")
+			return errors.New("expects caller ID to be empty or a valid identifier")
 		}
 	}
 
@@ -3435,6 +3828,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersPromote(ctx context.Context, callerID,
 // @group groups
 // @summary Demote users in a group.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param callerId(type=string, optional=true) User ID of the caller, will apply permissions checks of the user. If empty defaults to system user and permissions are bypassed.
 // @param groupId(type=string) The ID of the group whose members are being demoted.
 // @param userIds(type=[]string) Table array of user IDs to demote.
 // @return error(error) An optional error value if an error occurred.
@@ -3443,7 +3837,7 @@ func (n *RuntimeGoNakamaModule) GroupUsersDemote(ctx context.Context, callerID, 
 	if callerID != "" {
 		var err error
 		if caller, err = uuid.FromString(callerID); err != nil {
-			return errors.New("expects caller ID to be a valid identifier")
+			return errors.New("expects caller ID to be empty or a valid identifier")
 		}
 	}
 
@@ -3472,11 +3866,11 @@ func (n *RuntimeGoNakamaModule) GroupUsersDemote(ctx context.Context, callerID, 
 }
 
 // @group groups
-// @summary List all members, admins and superadmins which belong to a group. This also list incoming join requests.
+// @summary List all members, admins and superadmins which belong to a group. This also lists incoming join requests.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param groupId(type=string) The ID of the group to list members for.
 // @param limit(type=int) Return only the required number of users denoted by this limit value.
-// @param state(type=int) Return only the required number of users denoted by this limit value.
+// @param state(type=int) Return only the users matching this state value, '0' for superadmins for example.
 // @param cursor(type=string) Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return groupUsers([]*api.GroupUserList_GroupUser) The user information for members, admins and superadmins for the group. Also users who sent a join request.
 // @return error(error) An optional error value if an error occurred.
@@ -3486,8 +3880,8 @@ func (n *RuntimeGoNakamaModule) GroupUsersList(ctx context.Context, id string, l
 		return nil, "", errors.New("expects group ID to be a valid identifier")
 	}
 
-	if limit < 1 || limit > 100 {
-		return nil, "", errors.New("expects limit to be 1-100")
+	if limit < 1 || limit > 10000 {
+		return nil, "", errors.New("expects limit to be 1-10000")
 	}
 
 	var stateWrapper *wrapperspb.Int32Value
@@ -3510,12 +3904,12 @@ func (n *RuntimeGoNakamaModule) GroupUsersList(ctx context.Context, id string, l
 // @group groups
 // @summary Find groups based on the entered criteria.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param name(type=string) Search for groups that contain this value in their name.
-// @param langTag(type=string) Filter based upon the entered language tag.
-// @param members(type=int) Search by number of group members.
-// @param open(type=bool) Filter based on whether groups are Open or Closed.
-// @param limit(type=int) Return only the required number of groups denoted by this limit value.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param name(type=string, optional=true) Search for groups that contain this value in their name. Cannot be combined with any other filter.
+// @param langTag(type=string, optional=true) Filter based upon the entered language tag.
+// @param members(type=int, optional=true) Search by number of group members.
+// @param open(type=bool, optional=true) Filter based on whether groups are Open or Closed.
+// @param limit(type=int, optional=true) Return only the required number of groups denoted by this limit value.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return groups([]*api.Group) A list of groups.
 // @return cursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any). Will be set to "" or nil when fetching last available page.
 // @return error(error) An optional error value if an error occurred.
@@ -3545,7 +3939,7 @@ func (n *RuntimeGoNakamaModule) GroupsList(ctx context.Context, name, langTag st
 // @summary Fetch one or more groups randomly.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param count(type=int) The number of groups to fetch.
-// @return users([]*api.Groups) A list of group record objects.
+// @return users([]*api.Group) A list of group record objects.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeGoNakamaModule) GroupsGetRandom(ctx context.Context, count int) ([]*api.Group, error) {
 	if count == 0 {
@@ -3564,7 +3958,7 @@ func (n *RuntimeGoNakamaModule) GroupsGetRandom(ctx context.Context, count int) 
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The ID of the user to list groups for.
 // @param limit(type=int) The maximum number of entries in the listing.
-// @param state(type=int) The state of the user within the group. If unspecified this returns users in all states.
+// @param state(type=int, optional=true) The state of the user within the group. If unspecified this returns users in all states.
 // @param cursor(type=string) Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return userGroups([]*api.UserGroupList_UserGroup) A table of groups with their fields.
 // @return cursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any). Will be set to "" or nil when fetching last available page.
@@ -3651,8 +4045,8 @@ func (n *RuntimeGoNakamaModule) MetricsTimerRecord(name string, tags map[string]
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param userId(type=string) The ID of the user whose friends, invites, invited, and blocked you want to list.
 // @param limit(type=int) The number of friends to retrieve in this page of results. No more than 100 limit allowed per result.
-// @param state(type=int) The state of the friendship with the user. If unspecified this returns friends in all states for the user.
-// @param cursor(type=string) Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param state(type=int, optional=true) The state of the friendship with the user. If unspecified this returns friends in all states for the user.
+// @param cursor(type=string) Pagination cursor from previous result. Set to "" to start fetching from the beginning.
 // @return friends([]*api.Friend) The user information for users that are friends of the current user.
 // @return cursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any). Will be set to "" or nil when fetching last available page.
 // @return error(error) An optional error value if an error occurred.
@@ -3662,8 +4056,8 @@ func (n *RuntimeGoNakamaModule) FriendsList(ctx context.Context, userID string, 
 		return nil, "", errors.New("expects user ID to be a valid identifier")
 	}
 
-	if limit < 1 || limit > 100 {
-		return nil, "", errors.New("expects limit to be 1-100")
+	if limit < 1 || limit > 1000 {
+		return nil, "", errors.New("expects limit to be 1-1000")
 	}
 
 	var stateWrapper *wrapperspb.Int32Value
@@ -3681,6 +4075,33 @@ func (n *RuntimeGoNakamaModule) FriendsList(ctx context.Context, userID string, 
 	}
 
 	return friends.Friends, friends.Cursor, nil
+}
+
+// @group friends
+// @summary List friends of friends.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param userId(type=string) The ID of the user whose friends of friends you want to list.
+// @param limit(type=int) The number of friends of friends to retrieve in this page of results. No more than 100 limit allowed per result.
+// @param cursor(type=string) Pagination cursor from previous result. Set to "" to start fetching from the beginning.
+// @return friends([]*api.FriendsOfFriendsList_FriendOfFriend) The user information for users that are friends of friends the current user.
+// @return cursor(string) An optional next page cursor that can be used to retrieve the next page of records (if any). Will be set to "" or nil when fetching last available page.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeGoNakamaModule) FriendsOfFriendsList(ctx context.Context, userID string, limit int, cursor string) ([]*api.FriendsOfFriendsList_FriendOfFriend, string, error) {
+	uid, err := uuid.FromString(userID)
+	if err != nil {
+		return nil, "", errors.New("expects user ID to be a valid identifier")
+	}
+
+	if limit < 1 || limit > 1000 {
+		return nil, "", errors.New("expects limit to be 1-1000")
+	}
+
+	friends, err := ListFriendsOfFriends(ctx, n.logger, n.db, n.statusRegistry, uid, limit, cursor)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return friends.FriendsOfFriends, friends.Cursor, nil
 }
 
 // @group friends
@@ -3733,7 +4154,7 @@ func (n *RuntimeGoNakamaModule) FriendsAdd(ctx context.Context, userID string, u
 	allIDs = append(allIDs, ids...)
 	allIDs = append(allIDs, fetchIDs...)
 
-	err = AddFriends(ctx, n.logger, n.db, n.router, userUUID, username, allIDs)
+	err = AddFriends(ctx, n.logger, n.db, n.tracker, n.router, userUUID, username, allIDs)
 	if err != nil {
 		return err
 	}
@@ -3849,7 +4270,7 @@ func (n *RuntimeGoNakamaModule) FriendsBlock(ctx context.Context, userID string,
 	allIDs = append(allIDs, ids...)
 	allIDs = append(allIDs, fetchIDs...)
 
-	err = BlockFriends(ctx, n.logger, n.db, userUUID, allIDs)
+	err = BlockFriends(ctx, n.logger, n.db, n.tracker, userUUID, allIDs)
 	if err != nil {
 		return err
 	}
@@ -3868,8 +4289,8 @@ func (n *RuntimeGoNakamaModule) SetEventFn(fn RuntimeEventCustomFunction) {
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param channelId(type=string) The ID of the channel to send the message on.
 // @param content(type=map[string]interface{}) Message content.
-// @param senderId(type=string) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
-// @param senderUsername(type=string) The username of the user to send this message as. If left empty, it will be assumed that it is a system message.
+// @param senderId(type=string, optional=true) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
+// @param senderUsername(type=string, optional=true) The username of the user to send this message as. If left empty, it will be assumed that it is a system message.
 // @param persist(type=bool) Whether to record this message in the channel history.
 // @return channelMessageSend(*rtapi.ChannelMessageAck) Message sent ack containing the following variables: 'channelId', 'contentStr', 'senderId', 'senderUsername', and 'persist'.
 // @return error(error) An optional error value if an error occurred.
@@ -3897,8 +4318,8 @@ func (n *RuntimeGoNakamaModule) ChannelMessageSend(ctx context.Context, channelI
 // @param channelId(type=string) The ID of the channel to send the message on.
 // @param messageId(type=string) The ID of the message to update.
 // @param content(type=map[string]interface{}) Message content.
-// @param senderId(type=string) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
-// @param senderUsername(type=string) The username of the user to send this message as. If left empty, it will be assumed that it is a system message.
+// @param senderId(type=string, optional=true) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
+// @param senderUsername(type=string, optional=true) The username of the user to send this message as. If left empty, it will be assumed that it is a system message.
 // @param persist(type=bool) Whether to record this message in the channel history.
 // @return channelMessageUpdate(*rtapi.ChannelMessageAck) Message updated ack containing the following variables: 'channelId', 'contentStr', 'senderId', 'senderUsername', and 'persist'.
 // @return error(error) An optional error value if an error occurred.
@@ -3929,8 +4350,8 @@ func (n *RuntimeGoNakamaModule) ChannelMessageUpdate(ctx context.Context, channe
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param channelId(type=string) The ID of the channel to remove the message on.
 // @param messageId(type=string) The ID of the message to remove.
-// @param senderId(type=string) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
-// @param senderUsername(type=string) The username of the user who sent this message. If left empty, it will be assumed that it is a system message.
+// @param senderId(type=string, optional=true) The UUID for the sender of this message. If left empty, it will be assumed that it is a system message.
+// @param senderUsername(type=string, optional=true) The username of the user who sent this message. If left empty, it will be assumed that it is a system message.
 // @param persist(type=bool) Whether to record this in the channel history.
 // @return channelMessageRemove(*rtapi.ChannelMessageAck) Message removed ack containing the following variables: 'channelId', 'contentStr', 'senderId', 'senderUsername', and 'persist'.
 // @return error(error) An optional error value if an error occurred.
@@ -3953,7 +4374,7 @@ func (n *RuntimeGoNakamaModule) ChannelMessageRemove(ctx context.Context, channe
 // @param channelId(type=string) The ID of the channel to list messages from.
 // @param limit(type=int) The number of messages to return per page.
 // @param forward(type=bool) Whether to list messages from oldest to newest, or newest to oldest.
-// @param cursor(type=string"") Pagination cursor from previous result. Don't set to start fetching from the beginning.
+// @param cursor(type=string, optional=true, default="") Pagination cursor from previous result. Don't set to start fetching from the beginning.
 // @return channelMessageList([]*rtapi.ChannelMessage) Messages from the specified channel.
 // @return nextCursor(string) Cursor for the next page of messages, if any.
 // @return prevCursor(string) Cursor for the previous page of messages, if any.
@@ -4007,4 +4428,11 @@ func (n *RuntimeGoNakamaModule) ChannelIdBuild(ctx context.Context, senderId, ta
 // @return satori(runtime.Satori) The Satori client.
 func (n *RuntimeGoNakamaModule) GetSatori() runtime.Satori {
 	return n.satori
+}
+
+// @group fleetmanager
+// @symmary Get the Fleet Manager client.
+// @return fleetManager(runtime.FleetManager) The Fleet Manager client.
+func (n *RuntimeGoNakamaModule) GetFleetManager() runtime.FleetManager {
+	return n.fleetManager
 }

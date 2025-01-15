@@ -17,7 +17,7 @@ package server
 import (
 	"context"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/zap"
@@ -195,7 +195,7 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
 	}
 
-	err = DeleteGroup(ctx, s.logger, s.db, groupID, userID)
+	err = DeleteGroup(ctx, s.logger, s.db, s.tracker, groupID, userID)
 	if err != nil {
 		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.InvalidArgument, "Group not found or you're not allowed to delete.")
@@ -252,7 +252,7 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
 	}
 
-	err = JoinGroup(ctx, s.logger, s.db, s.router, groupID, userID, username)
+	err = JoinGroup(ctx, s.logger, s.db, s.tracker, s.router, groupID, userID, username)
 	if err != nil {
 		if err == runtime.ErrGroupNotFound {
 			return nil, status.Error(codes.NotFound, "Group not found.")
@@ -380,7 +380,7 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 		userIDs = append(userIDs, uid)
 	}
 
-	err = AddGroupUsers(ctx, s.logger, s.db, s.router, userID, groupID, userIDs)
+	err = AddGroupUsers(ctx, s.logger, s.db, s.tracker, s.router, userID, groupID, userIDs)
 	if err != nil {
 		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")

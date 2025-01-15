@@ -15,9 +15,10 @@
 import {Component, OnInit, OnDestroy, Injectable, Pipe, PipeTransform} from '@angular/core';
 import {ConsoleService, StatusList, StatusListStatus} from '../console.service';
 import {Observable, of, Subscription, timer} from 'rxjs';
-import {FormBuilder, FormGroup} from '@angular/forms';
+import {UntypedFormBuilder, UntypedFormGroup} from '@angular/forms';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, RouterStateSnapshot} from '@angular/router';
 import {catchError, mergeMap} from 'rxjs/operators';
+import {Color, ColorHelper} from '@swimlane/ngx-charts';
 
 @Component({
   selector: 'app-status',
@@ -32,7 +33,7 @@ export class StatusComponent implements OnInit, OnDestroy {
   public latencyGraphData = [];
   public inputGraphData = [];
   public outputGraphData = [];
-  public rangeForm: FormGroup;
+  public rangeForm: UntypedFormGroup;
   public readonly ranges = {
     1: 'last 1 minute',
     10: 'last 10 minutes',
@@ -43,7 +44,7 @@ export class StatusComponent implements OnInit, OnDestroy {
   public rangesKeys = Object.keys(this.ranges).map(n => +n);
   public readonly colorScheme = {
     domain: ['#5AA454', '#E44D25', '#1e59cf', '#7aa3e5', '#a8385d', '#d0bd00']
-  };
+  } as Color;
   private readonly samples = 60; // Number of samples in the series
   private refreshTimer: Observable<number>;
   private $refreshTimer: Subscription;
@@ -51,7 +52,7 @@ export class StatusComponent implements OnInit, OnDestroy {
   constructor(
     private readonly route: ActivatedRoute,
     private readonly consoleService: ConsoleService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
   ) {}
 
   ngOnInit(): void {

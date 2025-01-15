@@ -87,7 +87,7 @@ For Windows development and environments where you want to use our official Dock
 
    In the command above we bind-mount your current folder into the container and use the Go toolchain inside it to run the build. The output artifacts are written back into your host filesystem.
 
-2. Use our official Docker Compose [file](https://heroiclabs.com/docs/install-docker-quickstart/#using-docker-compose) to run all containers together and load in your custom module.
+2. Use our official Docker Compose [file](https://heroiclabs.com/docs/nakama/getting-started/install/docker/#running-nakama) to run all containers together and load in your custom module.
 
     __NOTE:__ You should copy the `.so` files generated in step 1. to the `/modules` folder of your Nakama source files and then run the command below from the Nakama root directory.
 
@@ -101,6 +101,6 @@ For Windows development and environments where you want to use our official Dock
 
 ## Bigger Example
 
-Have a look in this repo for more example code on how to create and use various parts of the game server Go runtime support. This project creates an implementation of the Unreal Engine `IOnlinePartySystem` interface which uses Nakama server.
+Have a look in this repo for more example code on how to create and use various parts of the game server Go runtime support. The project implements a fully authoritative example of tic-tac-toe in Go, Lua and TS.
 
-https://github.com/heroiclabs/nakama-unreal/tree/master/online_party_system
+https://github.com/heroiclabs/nakama-project-template

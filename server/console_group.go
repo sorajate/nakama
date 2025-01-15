@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -170,7 +170,7 @@ func (s *ConsoleServer) DeleteGroup(ctx context.Context, in *console.DeleteGroup
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid group ID.")
 	}
 
-	if err = DeleteGroup(ctx, s.logger, s.db, groupID, uuid.Nil); err != nil {
+	if err = DeleteGroup(ctx, s.logger, s.db, s.tracker, groupID, uuid.Nil); err != nil {
 		// Error already logged in function above.
 		return nil, status.Error(codes.Internal, "An error occurred while trying to delete the user.")
 	}
@@ -317,13 +317,7 @@ func (s *ConsoleServer) DemoteGroupMember(ctx context.Context, in *console.Updat
 		var message *api.ChannelMessage
 		ts := time.Now().Unix()
 
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			logger.Error("Could not begin database transaction.", zap.Error(err))
-			return err
-		}
-
-		if err := ExecuteInTx(ctx, tx, func() error {
+		if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 			query := ""
 			if myState == 0 {
 				// Ensure we aren't removing the last superadmin when deleting authoritatively.
@@ -463,13 +457,7 @@ func (s *ConsoleServer) PromoteGroupMember(ctx context.Context, in *console.Upda
 		var message *api.ChannelMessage
 		ts := time.Now().Unix()
 
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			logger.Error("Could not begin database transaction.", zap.Error(err))
-			return err
-		}
-
-		if err := ExecuteInTx(ctx, tx, func() error {
+		if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 			if uid == caller {
 				return errors.New("cannot promote self")
 			}
@@ -577,12 +565,12 @@ func (s *ConsoleServer) AddGroupUsers(ctx context.Context, in *console.AddGroupU
 				s.logger.Debug("Could not retrieve username to join user to group.", zap.Error(err), zap.String("user_id", uid.String()))
 				return nil, status.Error(codes.Internal, "An error occurred while trying to join the user to the group. Refresh the page to see any updates.")
 			}
-			if err = JoinGroup(ctx, s.logger, s.db, s.router, groupUid, uid, username.String); err != nil {
+			if err = JoinGroup(ctx, s.logger, s.db, s.tracker, s.router, groupUid, uid, username.String); err != nil {
 				return nil, status.Error(codes.Internal, "An error occurred while trying to join an user to the group, refresh the page: "+err.Error()+". Refresh the page to see any updates.")
 			}
 		}
 	} else {
-		if err = AddGroupUsers(ctx, s.logger, s.db, s.router, uuid.Nil, groupUid, uuids); err != nil {
+		if err = AddGroupUsers(ctx, s.logger, s.db, s.tracker, s.router, uuid.Nil, groupUid, uuids); err != nil {
 			return nil, status.Error(codes.Internal, "An error occurred while trying to add the users: "+err.Error())
 		}
 	}

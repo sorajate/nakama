@@ -1,6 +1,6 @@
 """Generated an open-api spec for a grpc api spec.
 
-Reads the the api spec in protobuf format and generate an open-api spec.
+Reads the api spec in protobuf format and generate an open-api spec.
 Optionally applies settings from the grpc-service configuration.
 """
 
@@ -37,7 +37,7 @@ def _direct_source_infos(proto_info, provided_sources = []):
         local_offset = offset
         if src.root.path and not source_root.startswith(src.root.path):
             # Before Bazel 1.0, `proto_source_root` wasn't guaranteed to be a
-            # prefix of `src.path`. This could happend, e.g., if `file` was
+            # prefix of `src.path`. This could happened, e.g., if `file` was
             # generated (https://github.com/bazelbuild/bazel/issues/9215).
             local_offset += len(src.root.path) + 1  # + '/'.
         infos.append(struct(file = src, import_path = src.path[local_offset:]))
@@ -60,7 +60,11 @@ def _run_proto_gen_openapi(
         fqn_for_openapi_name,
         openapi_naming_strategy,
         use_go_templates,
+        go_template_args,
+        ignore_comments,
+        remove_internal_comments,
         disable_default_errors,
+        disable_service_tags,
         enums_as_ints,
         omit_enum_default_value,
         output_format,
@@ -68,13 +72,14 @@ def _run_proto_gen_openapi(
         proto3_optional_nullable,
         openapi_configuration,
         generate_unbound_methods,
-        visibility_restriction_selectors):
+        visibility_restriction_selectors,
+        use_allof_for_refs,
+        disable_default_responses,
+        enable_rpc_deprecation,
+        expand_slashed_path_patterns):
     args = actions.args()
 
     args.add("--plugin", "protoc-gen-openapiv2=%s" % protoc_gen_openapiv2.path)
-
-    args.add("--openapiv2_opt", "logtostderr=true")
-    args.add("--openapiv2_opt", "allow_repeated_fields_in_body=true")
 
     extra_inputs = []
     if grpc_api_configuration:
@@ -109,8 +114,20 @@ def _run_proto_gen_openapi(
     if use_go_templates:
         args.add("--openapiv2_opt", "use_go_templates=true")
 
+    for go_template_arg in go_template_args:
+        args.add("--openapiv2_opt", "go_template_args=%s" % go_template_arg)
+
+    if ignore_comments:
+        args.add("--openapiv2_opt", "ignore_comments=true")
+
+    if remove_internal_comments:
+        args.add("--openapiv2_opt", "remove_internal_comments=true")
+
     if disable_default_errors:
         args.add("--openapiv2_opt", "disable_default_errors=true")
+
+    if disable_service_tags:
+        args.add("--openapiv2_opt", "disable_service_tags=true")
 
     if enums_as_ints:
         args.add("--openapiv2_opt", "enums_as_ints=true")
@@ -126,6 +143,18 @@ def _run_proto_gen_openapi(
 
     for visibility_restriction_selector in visibility_restriction_selectors:
         args.add("--openapiv2_opt", "visibility_restriction_selectors=%s" % visibility_restriction_selector)
+
+    if use_allof_for_refs:
+        args.add("--openapiv2_opt", "use_allof_for_refs=true")
+
+    if disable_default_responses:
+        args.add("--openapiv2_opt", "disable_default_responses=true")
+
+    if enable_rpc_deprecation:
+        args.add("--openapiv2_opt", "enable_rpc_deprecation=true")
+
+    if expand_slashed_path_patterns:
+        args.add("--openapiv2_opt", "expand_slashed_path_patterns=true")
 
     args.add("--openapiv2_opt", "repeated_path_param_separator=%s" % repeated_path_param_separator)
 
@@ -219,7 +248,11 @@ def _proto_gen_openapi_impl(ctx):
                     fqn_for_openapi_name = ctx.attr.fqn_for_openapi_name,
                     openapi_naming_strategy = ctx.attr.openapi_naming_strategy,
                     use_go_templates = ctx.attr.use_go_templates,
+                    go_template_args = ctx.attr.go_template_args,
+                    ignore_comments = ctx.attr.ignore_comments,
+                    remove_internal_comments = ctx.attr.remove_internal_comments,
                     disable_default_errors = ctx.attr.disable_default_errors,
+                    disable_service_tags = ctx.attr.disable_service_tags,
                     enums_as_ints = ctx.attr.enums_as_ints,
                     omit_enum_default_value = ctx.attr.omit_enum_default_value,
                     output_format = ctx.attr.output_format,
@@ -228,6 +261,10 @@ def _proto_gen_openapi_impl(ctx):
                     openapi_configuration = ctx.file.openapi_configuration,
                     generate_unbound_methods = ctx.attr.generate_unbound_methods,
                     visibility_restriction_selectors = ctx.attr.visibility_restriction_selectors,
+                    use_allof_for_refs = ctx.attr.use_allof_for_refs,
+                    disable_default_responses = ctx.attr.disable_default_responses,
+                    enable_rpc_deprecation = ctx.attr.enable_rpc_deprecation,
+                    expand_slashed_path_patterns = ctx.attr.expand_slashed_path_patterns,
                 ),
             ),
         ),
@@ -284,9 +321,9 @@ protoc_gen_openapiv2 = rule(
         "openapi_naming_strategy": attr.string(
             default = "",
             mandatory = False,
-            values = ["", "simple", "legacy", "fqn"],
+            values = ["", "simple", "package", "legacy", "fqn"],
             doc = "configures how OpenAPI names are determined." +
-                  " Allowed values are `` (empty), `simple`, `legacy` and `fqn`." +
+                  " Allowed values are `` (empty), `simple`, `package`, `legacy` and `fqn`." +
                   " If unset, either `legacy` or `fqn` are selected, depending" +
                   " on the value of the `fqn_for_openapi_name` setting",
         ),
@@ -295,11 +332,35 @@ protoc_gen_openapiv2 = rule(
             mandatory = False,
             doc = "if set, you can use Go templates in protofile comments",
         ),
+        "go_template_args": attr.string_list(
+            mandatory = False,
+            doc = "specify a key value pair as inputs to the Go template of the protofile" +
+                  " comments. Repeat this option to specify multiple template arguments." +
+                  " Requires the `use_go_templates` option to be set.",
+        ),
+        "ignore_comments": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, all protofile comments are excluded from output",
+        ),
+        "remove_internal_comments": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, removes all substrings in comments that start with " +
+                  "`(--` and end with `--)` as specified in " +
+                  "https://google.aip.dev/192#internal-comments",
+        ),
         "disable_default_errors": attr.bool(
             default = False,
             mandatory = False,
             doc = "if set, disables generation of default errors." +
                   " This is useful if you have defined custom error handling",
+        ),
+        "disable_service_tags": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, disables generation of service tags." +
+                  " This is useful if you do not want to expose the names of your backend grpc services.",
         ),
         "enums_as_ints": attr.bool(
             default = False,
@@ -345,6 +406,31 @@ protoc_gen_openapiv2 = rule(
                   " in the generated output when a visibility annotation is defined." +
                   " Repeat this option to supply multiple values. Elements without" +
                   " visibility annotations are unaffected by this setting.",
+        ),
+        "use_allof_for_refs": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, will use allOf as container for $ref to preserve" +
+                  " same-level properties.",
+        ),
+        "disable_default_responses": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, disables generation of default responses. Useful" +
+                  " if you have to support custom response codes that are" +
+                  " not 200.",
+        ),
+        "enable_rpc_deprecation": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "whether to process grpc method's deprecated option.",
+        ),
+        "expand_slashed_path_patterns": attr.bool(
+            default = False,
+            mandatory = False,
+            doc = "if set, expands path patterns containing slashes into URI." +
+                  " It also creates a new path parameter for each wildcard in " +
+                  " the path pattern.",
         ),
         "_protoc": attr.label(
             default = "@com_google_protobuf//:protoc",

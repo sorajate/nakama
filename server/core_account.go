@@ -23,11 +23,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgtype"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -49,9 +51,9 @@ type accountUpdate struct {
 	metadata    *wrapperspb.StringValue
 }
 
-func GetAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry *StatusRegistry, userID uuid.UUID) (*api.Account, error) {
-	var displayName sql.NullString
+func GetAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry StatusRegistry, userID uuid.UUID) (*api.Account, error) {
 	var username sql.NullString
+	var displayName sql.NullString
 	var avatarURL sql.NullString
 	var langTag sql.NullString
 	var location sql.NullString
@@ -71,7 +73,9 @@ func GetAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegis
 	var updateTime pgtype.Timestamptz
 	var verifyTime pgtype.Timestamptz
 	var disableTime pgtype.Timestamptz
-	var deviceIDs pgtype.VarcharArray
+	var deviceIDs pgtype.FlatArray[string]
+
+	m := pgtype.NewMap()
 
 	query := `
 SELECT u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
@@ -80,7 +84,7 @@ SELECT u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timez
 FROM users u
 WHERE u.id = $1`
 
-	if err := db.QueryRowContext(ctx, query, userID).Scan(&username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, &deviceIDs); err != nil {
+	if err := db.QueryRowContext(ctx, query, userID).Scan(&username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, m.SQLScanner(&deviceIDs)); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrAccountNotFound
 		}
@@ -88,17 +92,17 @@ WHERE u.id = $1`
 		return nil, err
 	}
 
-	devices := make([]*api.AccountDevice, 0, len(deviceIDs.Elements))
-	for _, deviceID := range deviceIDs.Elements {
-		devices = append(devices, &api.AccountDevice{Id: deviceID.String})
+	devices := make([]*api.AccountDevice, 0, len(deviceIDs))
+	for _, deviceID := range deviceIDs {
+		devices = append(devices, &api.AccountDevice{Id: deviceID})
 	}
 
 	var verifyTimestamp *timestamppb.Timestamp
-	if verifyTime.Status == pgtype.Present && verifyTime.Time.Unix() != 0 {
+	if verifyTime.Valid && verifyTime.Time.Unix() != 0 {
 		verifyTimestamp = &timestamppb.Timestamp{Seconds: verifyTime.Time.Unix()}
 	}
 	var disableTimestamp *timestamppb.Timestamp
-	if disableTime.Status == pgtype.Present && disableTime.Time.Unix() != 0 {
+	if disableTime.Valid && disableTime.Time.Unix() != 0 {
 		disableTimestamp = &timestamppb.Timestamp{Seconds: disableTime.Time.Unix()}
 	}
 
@@ -137,21 +141,14 @@ WHERE u.id = $1`
 	}, nil
 }
 
-func GetAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry *StatusRegistry, userIDs []string) ([]*api.Account, error) {
-	statements := make([]string, 0, len(userIDs))
-	parameters := make([]interface{}, 0, len(userIDs))
-	for _, userID := range userIDs {
-		parameters = append(parameters, userID)
-		statements = append(statements, "$"+strconv.Itoa(len(parameters)))
-	}
-
+func GetAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry StatusRegistry, userIDs []string) ([]*api.Account, error) {
 	query := `
 SELECT u.id, u.username, u.display_name, u.avatar_url, u.lang_tag, u.location, u.timezone, u.metadata, u.wallet,
 	u.email, u.apple_id, u.facebook_id, u.facebook_instant_game_id, u.google_id, u.gamecenter_id, u.steam_id, u.custom_id, u.edge_count,
 	u.create_time, u.update_time, u.verify_time, u.disable_time, array(select ud.id from user_device ud where u.id = ud.user_id)
 FROM users u
-WHERE u.id IN (` + strings.Join(statements, ",") + `)`
-	rows, err := db.QueryContext(ctx, query, parameters...)
+WHERE u.id = ANY($1)`
+	rows, err := db.QueryContext(ctx, query, userIDs)
 	if err != nil {
 		logger.Error("Error retrieving user accounts.", zap.Error(err))
 		return nil, err
@@ -181,26 +178,28 @@ WHERE u.id IN (` + strings.Join(statements, ",") + `)`
 		var updateTime pgtype.Timestamptz
 		var verifyTime pgtype.Timestamptz
 		var disableTime pgtype.Timestamptz
-		var deviceIDs pgtype.VarcharArray
+		var deviceIDs pgtype.FlatArray[string]
 
-		err = rows.Scan(&userID, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, &deviceIDs)
+		m := pgtype.NewMap()
+
+		err = rows.Scan(&userID, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata, &wallet, &email, &apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &customID, &edgeCount, &createTime, &updateTime, &verifyTime, &disableTime, m.SQLScanner(&deviceIDs))
 		if err != nil {
 			_ = rows.Close()
 			logger.Error("Error retrieving user accounts.", zap.Error(err))
 			return nil, err
 		}
 
-		devices := make([]*api.AccountDevice, 0, len(deviceIDs.Elements))
-		for _, deviceID := range deviceIDs.Elements {
-			devices = append(devices, &api.AccountDevice{Id: deviceID.String})
+		devices := make([]*api.AccountDevice, 0, len(deviceIDs))
+		for _, deviceID := range deviceIDs {
+			devices = append(devices, &api.AccountDevice{Id: deviceID})
 		}
 
 		var verifyTimestamp *timestamppb.Timestamp
-		if verifyTime.Status == pgtype.Present && verifyTime.Time.Unix() != 0 {
+		if verifyTime.Valid && verifyTime.Time.Unix() != 0 {
 			verifyTimestamp = &timestamppb.Timestamp{Seconds: verifyTime.Time.Unix()}
 		}
 		var disableTimestamp *timestamppb.Timestamp
-		if disableTime.Status == pgtype.Present && disableTime.Time.Unix() != 0 {
+		if disableTime.Valid && disableTime.Time.Unix() != 0 {
 			disableTimestamp = &timestamppb.Timestamp{Seconds: disableTime.Time.Unix()}
 		}
 
@@ -243,13 +242,7 @@ WHERE u.id IN (` + strings.Join(statements, ",") + `)`
 }
 
 func UpdateAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, updates []*accountUpdate) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return err
-	}
-
-	if err = ExecuteInTx(ctx, tx, func() error {
+	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
 		updateErr := updateAccounts(ctx, logger, tx, updates)
 		if updateErr != nil {
 			return updateErr
@@ -266,7 +259,7 @@ func UpdateAccounts(ctx context.Context, logger *zap.Logger, db *sql.DB, updates
 	return nil
 }
 
-func updateAccounts(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates []*accountUpdate) error {
+func updateAccounts(ctx context.Context, logger *zap.Logger, tx pgx.Tx, updates []*accountUpdate) error {
 	for _, update := range updates {
 		updateStatements := make([]string, 0, 7)
 		distinctStatements := make([]string, 0, 7)
@@ -352,7 +345,7 @@ func updateAccounts(ctx context.Context, logger *zap.Logger, tx *sql.Tx, updates
 		query := "UPDATE users SET update_time = now(), " + strings.Join(updateStatements, ", ") +
 			" WHERE id = $1 AND (" + strings.Join(distinctStatements, " OR ") + ")"
 
-		if _, err := tx.ExecContext(ctx, query, params...); err != nil {
+		if _, err := tx.Exec(ctx, query, params...); err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "users_username_key") {
 				return errors.New("Username is already in use.")
@@ -415,7 +408,7 @@ func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID u
 	}
 
 	// Notifications.
-	notifications, err := NotificationList(ctx, logger, db, userID, 0, "", nil)
+	notifications, err := NotificationList(ctx, logger, db, userID, 0, "", true)
 	if err != nil {
 		logger.Error("Could not fetch notifications", zap.Error(err), zap.String("user_id", userID.String()))
 		return nil, status.Error(codes.Internal, "An error occurred while trying to export user data.")
@@ -470,17 +463,15 @@ func ExportAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, userID u
 	return export, nil
 }
 
-func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, tracker Tracker, userID uuid.UUID, recorded bool) error {
-	ts := time.Now().UTC().Unix()
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return err
+func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config Config, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, sessionRegistry SessionRegistry, sessionCache SessionCache, tracker Tracker, userID uuid.UUID, recorded bool) error {
+	if userID == uuid.Nil {
+		return errors.New("cannot delete the system user")
 	}
 
+	ts := time.Now().UTC().Unix()
+
 	var deleted bool
-	if err := ExecuteInTx(ctx, tx, func() error {
+	if err := ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 		count, err := DeleteUser(ctx, tx, userID)
 		if err != nil {
 			logger.Debug("Could not delete user", zap.Error(err), zap.String("user_id", userID.String()))
@@ -490,7 +481,7 @@ func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config C
 			return nil
 		}
 
-		err = LeaderboardRecordsDeleteAll(ctx, logger, leaderboardRankCache, tx, userID, ts)
+		err = LeaderboardRecordsDeleteAll(ctx, logger, leaderboardCache, leaderboardRankCache, tx, userID, ts)
 		if err != nil {
 			logger.Debug("Could not delete leaderboard records.", zap.Error(err), zap.String("user_id", userID.String()))
 			return err
@@ -520,11 +511,11 @@ func DeleteAccount(ctx context.Context, logger *zap.Logger, db *sql.DB, config C
 
 	if deleted {
 		// Logout and disconnect.
-		if err = SessionLogout(config, sessionCache, userID, "", ""); err != nil {
+		if err := SessionLogout(config, sessionCache, userID, "", ""); err != nil {
 			return err
 		}
 		for _, presence := range tracker.ListPresenceIDByStream(PresenceStream{Mode: StreamModeNotifications, Subject: userID}) {
-			if err = sessionRegistry.Disconnect(ctx, presence.SessionID, false); err != nil {
+			if err := sessionRegistry.Disconnect(ctx, presence.SessionID, false); err != nil {
 				return err
 			}
 		}

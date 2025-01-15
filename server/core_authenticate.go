@@ -24,12 +24,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
-
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/social"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
@@ -63,7 +62,7 @@ func AuthenticateApple(ctx context.Context, logger *zap.Logger, db *sql.DB, clie
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("appleID", profile.ID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -78,7 +77,7 @@ func AuthenticateApple(ctx context.Context, logger *zap.Logger, db *sql.DB, clie
 
 	// Create a new account.
 	userID := uuid.Must(uuid.NewV4()).String()
-	query = "INSERT INTO users (id, username, email, apple_id, create_time, update_time) VALUES ($1, $2, $3, $4, now(), now())"
+	query = "INSERT INTO users (id, username, email, apple_id, create_time, update_time) VALUES ($1, $2, nullif($3, ''), $4, now(), now())"
 	result, err := db.ExecContext(ctx, query, userID, username, profile.Email, profile.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -139,7 +138,7 @@ func AuthenticateCustom(ctx context.Context, logger *zap.Logger, db *sql.DB, cus
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("customID", customID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -209,7 +208,7 @@ func AuthenticateDevice(ctx context.Context, logger *zap.Logger, db *sql.DB, dev
 		}
 
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("deviceID", deviceID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -225,13 +224,7 @@ func AuthenticateDevice(ctx context.Context, logger *zap.Logger, db *sql.DB, dev
 	// Create a new account.
 	userID := uuid.Must(uuid.NewV4()).String()
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return "", "", false, status.Error(codes.Internal, "Error finding or creating user account.")
-	}
-
-	err = ExecuteInTx(ctx, tx, func() error {
+	err = ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 		query := `
 INSERT INTO users (id, username, create_time, update_time)
 SELECT $1 AS id,
@@ -310,7 +303,7 @@ func AuthenticateEmail(ctx context.Context, logger *zap.Logger, db *sql.DB, emai
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("email", email), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -379,7 +372,7 @@ func AuthenticateUsername(ctx context.Context, logger *zap.Logger, db *sql.DB, u
 	}
 
 	// Check if it's disabled.
-	if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+	if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 		logger.Info("User account is disabled.", zap.String("username", username))
 		return "", status.Error(codes.PermissionDenied, "User account banned.")
 	}
@@ -399,10 +392,9 @@ func AuthenticateUsername(ctx context.Context, logger *zap.Logger, db *sql.DB, u
 	return dbUserID, nil
 }
 
-func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, client *social.Client, appId, accessToken, username string, create bool) (string, string, bool, bool, error) {
+func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, client *social.Client, appId, accessToken, username string, create bool) (string, string, bool, error) {
 	var facebookProfile *social.FacebookProfile
 	var err error
-	var importFriendsPossible bool
 
 	// Try Facebook Limited Login first.
 	facebookProfile, err = client.CheckFacebookLimitedLoginToken(ctx, appId, accessToken)
@@ -411,9 +403,8 @@ func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, c
 		facebookProfile, err = client.GetFacebookProfile(ctx, accessToken)
 		if err != nil {
 			logger.Info("Could not authenticate Facebook profile.", zap.Error(err))
-			return "", "", false, false, status.Error(codes.Unauthenticated, "Could not authenticate Facebook profile.")
+			return "", "", false, status.Error(codes.Unauthenticated, "Could not authenticate Facebook profile.")
 		}
-		importFriendsPossible = true
 	}
 	found := true
 
@@ -428,24 +419,24 @@ func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, c
 			found = false
 		} else {
 			logger.Error("Error looking up user by Facebook ID.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create))
-			return "", "", false, false, status.Error(codes.Internal, "Error finding user account.")
+			return "", "", false, status.Error(codes.Internal, "Error finding user account.")
 		}
 	}
 
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create))
-			return "", "", false, false, status.Error(codes.PermissionDenied, "User account banned.")
+			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
 
-		return dbUserID, dbUsername, false, importFriendsPossible, nil
+		return dbUserID, dbUsername, false, nil
 	}
 
 	if !create {
 		// No user account found, and creation is not allowed.
-		return "", "", false, false, status.Error(codes.NotFound, "User account not found.")
+		return "", "", false, status.Error(codes.NotFound, "User account not found.")
 	}
 
 	// Create a new account.
@@ -457,20 +448,20 @@ func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, c
 		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
 			if strings.Contains(pgErr.Message, "users_username_key") {
 				// Username is already in use by a different account.
-				return "", "", false, false, status.Error(codes.AlreadyExists, "Username is already in use.")
+				return "", "", false, status.Error(codes.AlreadyExists, "Username is already in use.")
 			} else if strings.Contains(pgErr.Message, "users_facebook_id_key") {
 				// A concurrent write has inserted this Facebook ID.
 				logger.Info("Did not insert new user as Facebook ID already exists.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create))
-				return "", "", false, false, status.Error(codes.Internal, "Error finding or creating user account.")
+				return "", "", false, status.Error(codes.Internal, "Error finding or creating user account.")
 			}
 		}
 		logger.Error("Cannot find or create user with Facebook ID.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create))
-		return "", "", false, false, status.Error(codes.Internal, "Error finding or creating user account.")
+		return "", "", false, status.Error(codes.Internal, "Error finding or creating user account.")
 	}
 
 	if rowsAffectedCount, _ := result.RowsAffected(); rowsAffectedCount != 1 {
 		logger.Error("Did not insert new user.", zap.Int64("rows_affected", rowsAffectedCount))
-		return "", "", false, false, status.Error(codes.Internal, "Error finding or creating user account.")
+		return "", "", false, status.Error(codes.Internal, "Error finding or creating user account.")
 	}
 
 	// Import email address, if it exists.
@@ -482,12 +473,12 @@ func AuthenticateFacebook(ctx context.Context, logger *zap.Logger, db *sql.DB, c
 				logger.Warn("Skipping facebook account email import as it is already set in another user.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create), zap.String("created_user_id", userID))
 			} else {
 				logger.Error("Failed to import facebook account email.", zap.Error(err), zap.String("facebookID", facebookProfile.ID), zap.String("username", username), zap.Bool("create", create), zap.String("created_user_id", userID))
-				return "", "", false, false, status.Error(codes.Internal, "Error importing facebook account email.")
+				return "", "", false, status.Error(codes.Internal, "Error importing facebook account email.")
 			}
 		}
 	}
 
-	return userID, username, true, importFriendsPossible, nil
+	return userID, username, true, nil
 }
 
 func AuthenticateFacebookInstantGame(ctx context.Context, logger *zap.Logger, db *sql.DB, client *social.Client, appSecret string, signedPlayerInfo string, username string, create bool) (string, string, bool, error) {
@@ -516,7 +507,7 @@ func AuthenticateFacebookInstantGame(ctx context.Context, logger *zap.Logger, db
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("facebookInstantGameID", facebookInstantGameID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -583,7 +574,7 @@ func AuthenticateGameCenter(ctx context.Context, logger *zap.Logger, db *sql.DB,
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("gameCenterID", playerID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -685,7 +676,7 @@ func AuthenticateGoogle(ctx context.Context, logger *zap.Logger, db *sql.DB, cli
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.String("googleID", googleProfile.GetGoogleId()), zap.String("username", username), zap.Bool("create", create))
 			return "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -792,7 +783,7 @@ func AuthenticateSteam(ctx context.Context, logger *zap.Logger, db *sql.DB, clie
 	// Existing account found.
 	if found {
 		// Check if it's disabled.
-		if dbDisableTime.Status == pgtype.Present && dbDisableTime.Time.Unix() != 0 {
+		if dbDisableTime.Valid && dbDisableTime.Time.Unix() != 0 {
 			logger.Info("User account is disabled.", zap.Error(err), zap.String("steamID", steamID), zap.String("username", username), zap.Bool("create", create))
 			return "", "", "", false, status.Error(codes.PermissionDenied, "User account banned.")
 		}
@@ -833,12 +824,14 @@ func AuthenticateSteam(ctx context.Context, logger *zap.Logger, db *sql.DB, clie
 	return userID, username, steamID, true, nil
 }
 
-func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRouter MessageRouter, client *social.Client, userID uuid.UUID, username, publisherKey, steamId string, reset bool) error {
+func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, client *social.Client, userID uuid.UUID, username, publisherKey, steamId string, reset bool) error {
 	logger = logger.With(zap.String("userID", userID.String()))
 
 	steamProfiles, err := client.GetSteamFriends(ctx, publisherKey, steamId)
-	if err != nil {
-		logger.Info("Could not import Steam friends.", zap.Error(err))
+	var unauthorizedErr *social.UnauthorizedError
+	if err != nil && !errors.As(err, &unauthorizedErr) {
+		// If error is unauthorized it means the profile or friends is private, ignore.
+		logger.Error("Could not import Steam friends.", zap.Error(err))
 		return status.Error(codes.Unauthenticated, "Could not authenticate Steam profile.")
 	}
 
@@ -848,13 +841,7 @@ func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, mes
 	}
 
 	var friendUserIDs []uuid.UUID
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return status.Error(codes.Internal, "Error importing Steam friends.")
-	}
-
-	err = ExecuteInTx(ctx, tx, func() error {
+	err = ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 		if reset {
 			if err := resetUserFriends(ctx, tx, userID); err != nil {
 				logger.Error("Could not reset user friends", zap.Error(err))
@@ -867,15 +854,13 @@ func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, mes
 			return nil
 		}
 
-		statements := make([]string, 0, len(steamProfiles))
-		params := make([]interface{}, 0, len(steamProfiles))
-		for i, steamProfile := range steamProfiles {
-			statements = append(statements, "$"+strconv.Itoa(i+1))
-			params = append(params, strconv.FormatUint(steamProfile.SteamID, 10))
+		steamIDs := make([]string, 0, len(steamProfiles))
+		for _, steamProfile := range steamProfiles {
+			steamIDs = append(steamIDs, strconv.FormatUint(steamProfile.SteamID, 10))
 		}
 
-		query := "SELECT id FROM users WHERE steam_id IN (" + strings.Join(statements, ", ") + ")"
-		rows, err := tx.QueryContext(ctx, query, params...)
+		query := "SELECT id FROM users WHERE steam_id = ANY($1::text[])"
+		rows, err := tx.QueryContext(ctx, query, steamIDs)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				// None of the friend profiles exist.
@@ -885,7 +870,7 @@ func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, mes
 		}
 
 		var id string
-		possibleFriendIDs := make([]uuid.UUID, 0, len(statements))
+		possibleFriendIDs := make([]uuid.UUID, 0, len(steamIDs))
 		for rows.Next() {
 			err = rows.Scan(&id)
 			if err != nil {
@@ -909,18 +894,18 @@ func importSteamFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, mes
 	}
 
 	if len(friendUserIDs) != 0 {
-		sendFriendAddedNotification(ctx, logger, db, messageRouter, userID, username, friendUserIDs)
+		sendFriendAddedNotification(ctx, logger, db, tracker, messageRouter, userID, username, friendUserIDs)
 	}
 
 	return nil
 }
 
-func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRouter MessageRouter, client *social.Client, userID uuid.UUID, username, token string, reset bool) error {
+func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, client *social.Client, userID uuid.UUID, username, token string, reset bool) error {
 	logger = logger.With(zap.String("userID", userID.String()))
 
 	facebookProfiles, err := client.GetFacebookFriends(ctx, token)
 	if err != nil {
-		logger.Info("Could not import Facebook friends.", zap.Error(err))
+		logger.Error("Could not import Facebook friends.", zap.Error(err))
 		return status.Error(codes.Unauthenticated, "Could not authenticate Facebook profile.")
 	}
 
@@ -930,13 +915,7 @@ func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 	}
 
 	var friendUserIDs []uuid.UUID
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("Could not begin database transaction.", zap.Error(err))
-		return status.Error(codes.Internal, "Error importing Facebook friends.")
-	}
-
-	err = ExecuteInTx(ctx, tx, func() error {
+	err = ExecuteInTx(ctx, db, func(tx *sql.Tx) error {
 		if reset {
 			if err := resetUserFriends(ctx, tx, userID); err != nil {
 				logger.Error("Could not reset user friends", zap.Error(err))
@@ -949,15 +928,13 @@ func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 			return nil
 		}
 
-		statements := make([]string, 0, len(facebookProfiles))
-		params := make([]interface{}, 0, len(facebookProfiles))
-		for i, facebookProfile := range facebookProfiles {
-			statements = append(statements, "$"+strconv.Itoa(i+1))
+		params := make([]string, 0, len(facebookProfiles))
+		for _, facebookProfile := range facebookProfiles {
 			params = append(params, facebookProfile.ID)
 		}
 
-		query := "SELECT id FROM users WHERE facebook_id IN (" + strings.Join(statements, ", ") + ")"
-		rows, err := tx.QueryContext(ctx, query, params...)
+		query := "SELECT id FROM users WHERE facebook_id = ANY($1::text[])"
+		rows, err := tx.QueryContext(ctx, query, params)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				// None of the friend profiles exist.
@@ -967,7 +944,7 @@ func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 		}
 
 		var id string
-		possibleFriendIDs := make([]uuid.UUID, 0, len(statements))
+		possibleFriendIDs := make([]uuid.UUID, 0, len(params))
 		for rows.Next() {
 			err = rows.Scan(&id)
 			if err != nil {
@@ -991,7 +968,7 @@ func importFacebookFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 	}
 
 	if len(friendUserIDs) != 0 {
-		sendFriendAddedNotification(ctx, logger, db, messageRouter, userID, username, friendUserIDs)
+		sendFriendAddedNotification(ctx, logger, db, tracker, messageRouter, userID, username, friendUserIDs)
 	}
 
 	return nil
@@ -1024,8 +1001,7 @@ func resetUserFriends(ctx context.Context, tx *sql.Tx, userID uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	statements := make([]string, 0, 10)
-	params := make([]interface{}, 0, 10)
+	params := make([]string, 0, 10)
 	for rows.Next() {
 		var id string
 		err = rows.Scan(&id)
@@ -1034,17 +1010,16 @@ func resetUserFriends(ctx context.Context, tx *sql.Tx, userID uuid.UUID) error {
 			return err
 		}
 		params = append(params, id)
-		statements = append(statements, "$"+strconv.Itoa(len(params)))
 	}
 	_ = rows.Close()
 
-	if len(statements) > 0 {
-		query = "UPDATE users SET edge_count = edge_count - 1 WHERE id IN (" + strings.Join(statements, ",") + ")"
-		result, err := tx.ExecContext(ctx, query, params...)
+	if len(params) > 0 {
+		query = "UPDATE users SET edge_count = edge_count - 1 WHERE id = ANY($1)"
+		result, err := tx.ExecContext(ctx, query, params)
 		if err != nil {
 			return err
 		}
-		if rowsAffectedCount, _ := result.RowsAffected(); rowsAffectedCount != int64(len(statements)) {
+		if rowsAffectedCount, _ := result.RowsAffected(); rowsAffectedCount != int64(len(params)) {
 			return errors.New("error updating edge count after friend reset")
 		}
 	}
@@ -1125,7 +1100,7 @@ AND EXISTS
 	return friendUserIDs
 }
 
-func sendFriendAddedNotification(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRouter MessageRouter, userID uuid.UUID, username string, friendUserIDs []uuid.UUID) {
+func sendFriendAddedNotification(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, userID uuid.UUID, username string, friendUserIDs []uuid.UUID) {
 	notifications := make(map[uuid.UUID][]*api.Notification, len(friendUserIDs))
 	content, _ := json.Marshal(map[string]interface{}{"username": username})
 	subject := "Your friend has just joined the game"
@@ -1142,5 +1117,5 @@ func sendFriendAddedNotification(ctx context.Context, logger *zap.Logger, db *sq
 		}}
 	}
 	// Any error is already logged before it's returned here.
-	_ = NotificationSend(ctx, logger, db, messageRouter, notifications)
+	_ = NotificationSend(ctx, logger, db, tracker, messageRouter, notifications)
 }

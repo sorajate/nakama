@@ -20,15 +20,19 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"strconv"
-	"strings"
+	"github.com/heroiclabs/nakama-common/runtime"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -49,7 +53,7 @@ type notificationCacheableCursor struct {
 	CreateTime     int64
 }
 
-func NotificationSend(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRouter MessageRouter, notifications map[uuid.UUID][]*api.Notification) error {
+func NotificationSend(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, notifications map[uuid.UUID][]*api.Notification) error {
 	persistentNotifications := make(map[uuid.UUID][]*api.Notification, len(notifications))
 	for userID, ns := range notifications {
 		for _, userNotification := range ns {
@@ -71,9 +75,23 @@ func NotificationSend(ctx context.Context, logger *zap.Logger, db *sql.DB, messa
 		}
 	}
 
+	recipients := make(map[PresenceStream][]*PresenceID, len(notifications))
+	for userID := range notifications {
+		recipients[PresenceStream{Mode: StreamModeNotifications, Subject: userID}] = make([]*PresenceID, 0, 1)
+	}
+	tracker.ListPresenceIDByStreams(recipients)
+
 	// Deliver live notifications to connected users.
-	for userID, ns := range notifications {
-		messageRouter.SendToStream(logger, PresenceStream{Mode: StreamModeNotifications, Subject: userID}, &rtapi.Envelope{
+	for stream, presenceIDs := range recipients {
+		if len(presenceIDs) == 0 {
+			continue
+		}
+		ns, found := notifications[stream.Subject]
+		if !found {
+			continue
+		}
+
+		messageRouter.SendToPresenceIDs(logger, presenceIDs, &rtapi.Envelope{
 			Message: &rtapi.Envelope_Notifications{
 				Notifications: &rtapi.Notifications{
 					Notifications: ns,
@@ -85,7 +103,7 @@ func NotificationSend(ctx context.Context, logger *zap.Logger, db *sql.DB, messa
 	return nil
 }
 
-func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, messageRouter MessageRouter, notification *api.Notification) error {
+func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, gotracker Tracker, messageRouter MessageRouter, notification *api.Notification) error {
 	// Non-persistent notifications don't need to work through all database users, just use currently connected notification streams.
 	if !notification.Persistent {
 		env := &rtapi.Envelope{
@@ -96,14 +114,8 @@ func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, tr
 			},
 		}
 
-		notificationStreamMode := StreamModeNotifications
-		streams := tracker.CountByStreamModeFilter(map[uint8]*uint8{StreamModeNotifications: &notificationStreamMode})
-		for streamPtr, count := range streams {
-			if streamPtr == nil || count == 0 {
-				continue
-			}
-			messageRouter.SendToStream(logger, *streamPtr, env, true)
-		}
+		messageRouter.SendToAll(logger, env, true)
+
 		return nil
 	}
 
@@ -190,27 +202,42 @@ func NotificationSendAll(ctx context.Context, logger *zap.Logger, db *sql.DB, tr
 	return nil
 }
 
-func NotificationList(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit int, cursor string, nc *notificationCacheableCursor) (*api.NotificationList, error) {
+func NotificationList(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, limit int, cursor string, cacheable bool) (*api.NotificationList, error) {
+	var nc *notificationCacheableCursor
+	if cursor != "" {
+		nc = &notificationCacheableCursor{}
+		cb, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			logger.Warn("Could not base64 decode notification cursor.", zap.String("cursor", cursor))
+			return nil, status.Error(codes.InvalidArgument, "Malformed cursor was used.")
+		}
+		if err = gob.NewDecoder(bytes.NewReader(cb)).Decode(nc); err != nil {
+			logger.Warn("Could not decode notification cursor.", zap.String("cursor", cursor))
+			return nil, status.Error(codes.InvalidArgument, "Malformed cursor was used.")
+		}
+	}
+
 	params := []interface{}{userID}
 
-	limitQuery := " "
+	limitQuery := ""
 	if limit > 0 {
-		params = append(params, limit)
+		params = append(params, limit+1)
 		limitQuery = " LIMIT $2"
 	}
 
-	cursorQuery := " "
+	cursorQuery := ""
 	if nc != nil && nc.NotificationID != nil {
 		cursorQuery = " AND (user_id, create_time, id) > ($1::UUID, $3::TIMESTAMPTZ, $4::UUID)"
-		params = append(params, &pgtype.Timestamptz{Time: time.Unix(0, nc.CreateTime).UTC(), Status: pgtype.Present}, uuid.FromBytesOrNil(nc.NotificationID))
+		params = append(params, &pgtype.Timestamptz{Time: time.Unix(0, nc.CreateTime).UTC(), Valid: true}, uuid.FromBytesOrNil(nc.NotificationID))
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	query := `
 SELECT id, subject, content, code, sender_id, create_time
 FROM notification
-WHERE user_id = $1`+cursorQuery+`
-ORDER BY create_time ASC, id ASC`+limitQuery, params...)
+WHERE user_id = $1` + cursorQuery + `
+ORDER BY create_time ASC, id ASC` + limitQuery
 
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Could not retrieve notifications.", zap.Error(err))
 		return nil, err
@@ -218,7 +245,14 @@ ORDER BY create_time ASC, id ASC`+limitQuery, params...)
 
 	notifications := make([]*api.Notification, 0, limit)
 	var lastCreateTime int64
+	var resultCount int
+	var hasNextPage bool
 	for rows.Next() {
+		resultCount++
+		if limit > 0 && resultCount > limit {
+			hasNextPage = true
+			break
+		}
 		no := &api.Notification{Persistent: true, CreateTime: &timestamppb.Timestamp{}}
 		var createTime pgtype.Timestamptz
 		if err := rows.Scan(&no.Id, &no.Subject, &no.Content, &no.Code, &no.SenderId, &createTime); err != nil {
@@ -239,45 +273,42 @@ ORDER BY create_time ASC, id ASC`+limitQuery, params...)
 	notificationList := &api.NotificationList{}
 	cursorBuf := new(bytes.Buffer)
 	if len(notifications) == 0 {
-		if len(cursor) > 0 {
-			notificationList.CacheableCursor = cursor
-		} else {
-			newCursor := &notificationCacheableCursor{NotificationID: nil, CreateTime: 0}
+		if cacheable {
+			if len(cursor) > 0 {
+				notificationList.CacheableCursor = cursor
+			} else {
+				newCursor := &notificationCacheableCursor{NotificationID: nil, CreateTime: 0}
+				if err := gob.NewEncoder(cursorBuf).Encode(newCursor); err != nil {
+					logger.Error("Could not create new cursor.", zap.Error(err))
+					return nil, err
+				}
+				notificationList.CacheableCursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
+			}
+		}
+	} else {
+		notificationList.Notifications = notifications
+		if cacheable || hasNextPage {
+			lastNotification := notifications[len(notifications)-1]
+			newCursor := &notificationCacheableCursor{
+				NotificationID: uuid.FromStringOrNil(lastNotification.Id).Bytes(),
+				CreateTime:     lastCreateTime,
+			}
 			if err := gob.NewEncoder(cursorBuf).Encode(newCursor); err != nil {
 				logger.Error("Could not create new cursor.", zap.Error(err))
 				return nil, err
 			}
+
 			notificationList.CacheableCursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
 		}
-	} else {
-		lastNotification := notifications[len(notifications)-1]
-		newCursor := &notificationCacheableCursor{
-			NotificationID: uuid.FromStringOrNil(lastNotification.Id).Bytes(),
-			CreateTime:     lastCreateTime,
-		}
-		if err := gob.NewEncoder(cursorBuf).Encode(newCursor); err != nil {
-			logger.Error("Could not create new cursor.", zap.Error(err))
-			return nil, err
-		}
-		notificationList.Notifications = notifications
-		notificationList.CacheableCursor = base64.RawURLEncoding.EncodeToString(cursorBuf.Bytes())
 	}
 
 	return notificationList, nil
 }
 
 func NotificationDelete(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID, notificationIDs []string) error {
-	statements := make([]string, 0, len(notificationIDs))
-	params := make([]interface{}, 0, len(notificationIDs)+1)
-	params = append(params, userID)
+	params := []any{userID, notificationIDs}
 
-	for _, id := range notificationIDs {
-		statement := "$" + strconv.Itoa(len(params)+1)
-		statements = append(statements, statement)
-		params = append(params, id)
-	}
-
-	query := "DELETE FROM notification WHERE user_id = $1 AND id IN (" + strings.Join(statements, ", ") + ")"
+	query := "DELETE FROM notification WHERE user_id = $1 AND id = ANY($2)"
 	logger.Debug("Delete notification query", zap.String("query", query), zap.Any("params", params))
 	_, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
@@ -289,35 +320,155 @@ func NotificationDelete(ctx context.Context, logger *zap.Logger, db *sql.DB, use
 }
 
 func NotificationSave(ctx context.Context, logger *zap.Logger, db *sql.DB, notifications map[uuid.UUID][]*api.Notification) error {
-	statements := make([]string, 0, len(notifications))
-	params := make([]interface{}, 0, len(notifications))
-	counter := 0
+	ids := make([]string, 0, len(notifications))
+	userIds := make([]uuid.UUID, 0, len(notifications))
+	subjects := make([]string, 0, len(notifications))
+	contents := make([]string, 0, len(notifications))
+	codes := make([]int32, 0, len(notifications))
+	senderIds := make([]string, 0, len(notifications))
+	query := `
+INSERT INTO
+	notification (id, user_id, subject, content, code, sender_id)
+SELECT
+	unnest($1::uuid[]),
+	unnest($2::uuid[]),
+	unnest($3::text[]),
+	unnest($4::jsonb[]),
+	unnest($5::smallint[]),
+	unnest($6::uuid[]);
+`
 	for userID, no := range notifications {
 		for _, un := range no {
-			statement := "$" + strconv.Itoa(counter+1) +
-				",$" + strconv.Itoa(counter+2) +
-				",$" + strconv.Itoa(counter+3) +
-				",$" + strconv.Itoa(counter+4) +
-				",$" + strconv.Itoa(counter+5) +
-				",$" + strconv.Itoa(counter+6)
-
-			counter = counter + 6
-			statements = append(statements, "("+statement+")")
-
-			params = append(params, un.Id)
-			params = append(params, userID)
-			params = append(params, un.Subject)
-			params = append(params, un.Content)
-			params = append(params, un.Code)
-			params = append(params, un.SenderId)
+			ids = append(ids, un.Id)
+			userIds = append(userIds, userID)
+			subjects = append(subjects, un.Subject)
+			contents = append(contents, un.Content)
+			codes = append(codes, un.Code)
+			senderIds = append(senderIds, un.SenderId)
 		}
 	}
 
-	query := "INSERT INTO notification (id, user_id, subject, content, code, sender_id) VALUES " + strings.Join(statements, ", ")
-
-	if _, err := db.ExecContext(ctx, query, params...); err != nil {
+	if _, err := db.ExecContext(ctx, query, ids, userIds, subjects, contents, codes, senderIds); err != nil {
 		logger.Error("Could not save notifications.", zap.Error(err))
 		return err
+	}
+
+	return nil
+}
+
+func NotificationsGetId(ctx context.Context, logger *zap.Logger, db *sql.DB, userID string, ids ...string) ([]*runtime.Notification, error) {
+	if len(ids) == 0 {
+		return []*runtime.Notification{}, nil
+	}
+
+	for _, id := range ids {
+		if _, err := uuid.FromString(id); err != nil {
+			return nil, errors.New("expects id to be a valid id string")
+		}
+	}
+
+	params := []any{ids}
+	query := "SELECT id, user_id, subject, content, code, sender_id, create_time FROM notification WHERE id = any($1)"
+	if userID != "" {
+		query += " AND user_id = $2"
+		params = append(params, userID)
+	}
+
+	rows, err := db.QueryContext(ctx, query, params...)
+	if err != nil {
+		logger.Error("failed to list notifications by id", zap.Error(err))
+		return nil, fmt.Errorf("failed to list notifications by id: %s", err.Error())
+	}
+
+	defer rows.Close()
+
+	notifications := make([]*runtime.Notification, 0, len(ids))
+	for rows.Next() {
+		no := &runtime.Notification{Persistent: true, CreateTime: &timestamppb.Timestamp{}}
+		var createTime pgtype.Timestamptz
+		var content string
+		if err := rows.Scan(&no.Id, &no.UserID, &no.Subject, &content, &no.Code, &no.Sender, &createTime); err != nil {
+			_ = rows.Close()
+			logger.Error("Failed to scan notification from database.", zap.Error(err))
+			return nil, err
+		}
+		no.CreateTime.Seconds = createTime.Time.Unix()
+
+		var contentMap map[string]any
+		if err = json.Unmarshal([]byte(content), &contentMap); err != nil {
+			logger.Error("Failed to unmarshal notification content", zap.Error(err))
+			return nil, err
+		}
+		no.Content = contentMap
+
+		if no.Sender == uuid.Nil.String() {
+			no.Sender = ""
+		}
+		notifications = append(notifications, no)
+	}
+
+	return notifications, nil
+}
+
+func NotificationsDeleteId(ctx context.Context, logger *zap.Logger, db *sql.DB, userID string, ids ...string) error {
+	if len(ids) == 0 {
+		// NOOP
+		return nil
+	}
+
+	for _, id := range ids {
+		if _, err := uuid.FromString(id); err != nil {
+			return errors.New("expects id to be a valid uuid")
+		}
+	}
+
+	if userID != "" {
+		uid, err := uuid.FromString(userID)
+		if err != nil {
+			return errors.New("expects id to be a valid uuid")
+		}
+
+		return NotificationDelete(ctx, logger, db, uid, ids)
+	}
+
+	if _, err := db.QueryContext(ctx, "DELETE FROM notification WHERE id = any($1)", ids); err != nil {
+		logger.Error("failed to delete notifications by id", zap.Error(err))
+		return fmt.Errorf("failed to delete notifications: %s", err.Error())
+	}
+
+	return nil
+}
+
+type notificationUpdate struct {
+	Id      uuid.UUID
+	Content map[string]any
+	Subject *string
+	Sender  *string
+}
+
+func NotificationsUpdate(ctx context.Context, logger *zap.Logger, db *sql.DB, updates ...notificationUpdate) error {
+	if len(updates) == 0 {
+		// NOOP
+		return nil
+	}
+
+	b := &pgx.Batch{}
+	for _, update := range updates {
+		b.Queue("UPDATE notification SET content = coalesce($1, content), subject = coalesce($2, subject), sender_id = coalesce($3, sender_id) WHERE id = $4", update.Content, update.Subject, update.Sender, update.Id)
+	}
+
+	if err := ExecuteInTxPgx(ctx, db, func(tx pgx.Tx) error {
+		r := tx.SendBatch(ctx, b)
+		_, err := r.Exec()
+		defer r.Close()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		logger.Error("failed to update notifications", zap.Error(err))
+		return fmt.Errorf("failed to update notifications: %s", err.Error())
 	}
 
 	return nil

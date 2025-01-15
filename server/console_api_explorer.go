@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
@@ -140,6 +140,9 @@ func (s *ConsoleServer) extractApiCallContext(ctx context.Context, in *console.C
 		callCtx = context.WithValue(callCtx, ctxVarsKey{}, map[string]string{})
 		callCtx = context.WithValue(callCtx, ctxExpiryKey{}, time.Now().Add(time.Duration(s.config.GetSession().TokenExpirySec)*time.Second).Unix())
 		callCtx = context.WithValue(callCtx, ctxFullMethodKey{}, "/nakama.api.Nakama/"+in.Method)
+		if in.SessionVars != nil {
+			callCtx = context.WithValue(callCtx, ctxVarsKey{}, in.SessionVars)
+		}
 	}
 	return callCtx, nil
 }

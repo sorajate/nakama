@@ -21,15 +21,17 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
-	"strconv"
+	"github.com/heroiclabs/nakama-common/runtime"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgtype"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -63,8 +65,12 @@ var (
 	}
 )
 
-func LeaderboardList(logger *zap.Logger, leaderboardCache LeaderboardCache, categoryStart, categoryEnd, limit int, cursor *LeaderboardListCursor) (*api.LeaderboardList, error) {
-	list, newCursor, err := leaderboardCache.List(categoryStart, categoryEnd, limit, cursor)
+type LeaderboardListCursor struct {
+	Offset int
+}
+
+func LeaderboardList(logger *zap.Logger, leaderboardCache LeaderboardCache, limit int, cursor *LeaderboardListCursor) (*api.LeaderboardList, error) {
+	list, newCursor, err := leaderboardCache.List(limit, cursor)
 	if err != nil {
 		logger.Error("Could not retrieve leaderboards", zap.Error(err))
 		return nil, err
@@ -280,16 +286,12 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		}
 	}
 
-	if ownerIds != nil && len(ownerIds) != 0 {
-		params := make([]interface{}, 0, len(ownerIds)+2)
-		params = append(params, leaderboardId, time.Unix(expiryTime, 0).UTC())
-		statements := make([]string, len(ownerIds))
-		for i, ownerID := range ownerIds {
-			params = append(params, ownerID)
-			statements[i] = "$" + strconv.Itoa(i+3)
-		}
+	if len(ownerIds) != 0 {
+		params := []any{leaderboardId, time.Unix(expiryTime, 0).UTC(), ownerIds}
+		query := `SELECT owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time
+FROM leaderboard_record
+WHERE leaderboard_id = $1 AND expiry_time = $2 AND owner_id = ANY($3)`
 
-		query := "SELECT owner_id, username, score, subscore, num_score, max_num_score, metadata, create_time, update_time FROM leaderboard_record WHERE leaderboard_id = $1 AND expiry_time = $2 AND owner_id IN (" + strings.Join(statements, ", ") + ")"
 		rows, err := db.QueryContext(ctx, query, params...)
 		if err != nil {
 			logger.Error("Error reading leaderboard records", zap.Error(err))
@@ -339,14 +341,41 @@ func LeaderboardRecordsList(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		_ = rows.Close()
 	}
 
+	// Sort owner records according to leaderboard ordering
+	var sortFn func(i, j int) bool
+	if leaderboard.SortOrder == LeaderboardSortOrderAscending {
+		sortFn = func(i, j int) bool {
+			if ownerRecords[i].Score == ownerRecords[j].Score {
+				if ownerRecords[i].Subscore == ownerRecords[j].Subscore {
+					return ownerRecords[i].OwnerId < ownerRecords[j].OwnerId
+				}
+				return ownerRecords[i].Subscore < ownerRecords[j].Subscore
+			}
+			return ownerRecords[i].Score < ownerRecords[j].Score
+		}
+	} else {
+		sortFn = func(i, j int) bool {
+			if ownerRecords[i].Score == ownerRecords[j].Score {
+				if ownerRecords[i].Subscore == ownerRecords[j].Subscore {
+					return ownerRecords[i].OwnerId > ownerRecords[j].OwnerId
+				}
+				return ownerRecords[i].Subscore > ownerRecords[j].Subscore
+			}
+			return ownerRecords[i].Score > ownerRecords[j].Score
+		}
+	}
+
+	sort.Slice(ownerRecords, sortFn)
+
 	// Bulk fill in the ranks of any owner records requested.
-	rankCache.Fill(leaderboardId, expiryTime, ownerRecords)
+	rankCount := rankCache.Fill(leaderboardId, expiryTime, ownerRecords, leaderboard.EnableRanks)
 
 	return &api.LeaderboardRecordList{
 		Records:      records,
 		OwnerRecords: ownerRecords,
 		NextCursor:   nextCursorStr,
 		PrevCursor:   prevCursorStr,
+		RankCount:    rankCount,
 	}, nil
 }
 
@@ -465,6 +494,7 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
             ON CONFLICT (owner_id, leaderboard_id, expiry_time)
             DO UPDATE SET ` + opSQL + `, num_score = leaderboard_record.num_score + 1, metadata = COALESCE($6, leaderboard_record.metadata), username = COALESCE($3, leaderboard_record.username), update_time = now()` + filterSQL + `
             RETURNING username, score, subscore, num_score, max_num_score, metadata, create_time, update_time`
+
 	params := make([]interface{}, 0, 9)
 	params = append(params, leaderboardId, ownerID)
 	if username == "" {
@@ -495,7 +525,9 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
 	var dbCreateTime pgtype.Timestamptz
 	var dbUpdateTime pgtype.Timestamptz
 
-	if err := db.QueryRowContext(ctx, query, params...).Scan(&dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime); err != nil {
+	err := db.QueryRowContext(ctx, query, params...).Scan(&dbUsername, &dbScore, &dbSubscore, &dbNumScore, &dbMaxNumScore, &dbMetadata, &dbCreateTime, &dbUpdateTime)
+
+	if err != nil {
 		var pgErr *pgconn.PgError
 		if err != sql.ErrNoRows && !(errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation && strings.Contains(pgErr.Message, "leaderboard_record_pkey")) {
 			logger.Error("Error writing leaderboard record", zap.Error(err))
@@ -521,7 +553,7 @@ func LeaderboardRecordWrite(ctx context.Context, logger *zap.Logger, db *sql.DB,
 		rank = rankCache.Get(leaderboardId, expiryTime, uuid.Must(uuid.FromString(ownerID)))
 	} else {
 		// Ensure we have the latest dbscore, dbsubscore if there was an update.
-		rank = rankCache.Insert(leaderboardId, expiryTime, leaderboard.SortOrder, uuid.Must(uuid.FromString(ownerID)), dbScore, dbSubscore)
+		rank = rankCache.Insert(leaderboardId, leaderboard.SortOrder, dbScore, dbSubscore, dbNumScore, expiryTime, uuid.Must(uuid.FromString(ownerID)), leaderboard.EnableRanks)
 	}
 
 	record := &api.LeaderboardRecord{
@@ -562,13 +594,15 @@ func LeaderboardRecordDelete(ctx context.Context, logger *zap.Logger, db *sql.DB
 	}
 
 	query := "DELETE FROM leaderboard_record WHERE leaderboard_id = $1 AND owner_id = $2 AND expiry_time = $3"
-	_, err := db.ExecContext(ctx, query, leaderboardId, ownerID, time.Unix(expiryTime, 0).UTC())
+	_, err := db.ExecContext(
+		ctx, query, leaderboardId, ownerID, time.Unix(expiryTime, 0).UTC())
 	if err != nil {
 		logger.Error("Error deleting leaderboard record", zap.Error(err))
 		return err
 	}
 
 	rankCache.Delete(leaderboardId, expiryTime, uuid.Must(uuid.FromString(ownerID)))
+
 	return nil
 }
 
@@ -584,7 +618,7 @@ func LeaderboardRecordReadAll(ctx context.Context, logger *zap.Logger, db *sql.D
 	return parseLeaderboardRecords(logger, rows)
 }
 
-func LeaderboardRecordsDeleteAll(ctx context.Context, logger *zap.Logger, leaderboardRankCache LeaderboardRankCache, tx *sql.Tx, userID uuid.UUID, currentTime int64) error {
+func LeaderboardRecordsDeleteAll(ctx context.Context, logger *zap.Logger, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, tx *sql.Tx, userID uuid.UUID, currentTime int64) error {
 	query := "DELETE FROM leaderboard_record WHERE owner_id = $1 RETURNING leaderboard_id, expiry_time"
 	rows, err := tx.QueryContext(ctx, query, userID.String())
 	if err != nil {
@@ -602,7 +636,7 @@ func LeaderboardRecordsDeleteAll(ctx context.Context, logger *zap.Logger, leader
 		}
 
 		expiryUnix := expiryTime.Time.Unix()
-		if expiryUnix <= currentTime {
+		if expiryUnix != 0 && expiryUnix <= currentTime {
 			// Expired ranks are handled by the rank cache itself.
 			continue
 		}
@@ -676,37 +710,7 @@ func calculatePrevReset(currentTime time.Time, startTime int64, resetSchedule *c
 		return 0
 	}
 
-	nextResets := resetSchedule.NextN(currentTime, 2)
-	t1 := nextResets[0]
-	t2 := nextResets[1]
-
-	resetPeriod := t2.Sub(t1)
-	sTime := t1.Add(resetPeriod * -2) // start from twice the period between the next resets back in time
-
-	nextReset := resetSchedule.Next(currentTime)
-	if nextReset.IsZero() {
-		return 0
-	}
-
-	var prevReset time.Time
-	nextResets = resetSchedule.NextN(sTime, 2)
-	for i, r := range nextResets {
-		if r.Equal(nextReset) {
-			if i == 0 {
-				// No prev reset exists, next reset is the first to occur.
-				return 0
-			}
-			// Prev reset was found.
-			prevReset = nextResets[i-1]
-			break
-		}
-	}
-
-	if prevReset.IsZero() {
-		return 0
-	}
-
-	return prevReset.Unix()
+	return resetSchedule.Last(currentTime).Unix()
 }
 
 func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, ownerID uuid.UUID, limit int, leaderboardId, cursor string, sortOrder int, expiryTime time.Time) (*api.LeaderboardRecordList, error) {
@@ -853,7 +857,12 @@ func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *
 		}
 
 		records = records[start:end]
-		rankCache.Fill(leaderboardId, expiryTime.Unix(), records)
+		l := leaderboardCache.Get(leaderboardId)
+		if l == nil {
+			// Should never happen unless leaderboard is concurrently deleted as records are being requested.
+			return nil, ErrLeaderboardNotFound
+		}
+		rankCount := rankCache.Fill(leaderboardId, expiryTime.Unix(), records, l.EnableRanks)
 
 		var prevCursorStr string
 		if setPrevCursor {
@@ -895,7 +904,7 @@ func getLeaderboardRecordsHaystack(ctx context.Context, logger *zap.Logger, db *
 			}
 		}
 
-		return &api.LeaderboardRecordList{Records: records, PrevCursor: prevCursorStr, NextCursor: nextCursorStr}, nil
+		return &api.LeaderboardRecordList{Records: records, PrevCursor: prevCursorStr, NextCursor: nextCursorStr, RankCount: rankCount}, nil
 	} else {
 		// If a cursor is passed, then this becomes a regular record listing operation.
 		return LeaderboardRecordsList(ctx, logger, db, leaderboardCache, rankCache, leaderboardId, wrapperspb.Int32(int32(limit)), cursor, nil, expiryTime.Unix())
@@ -964,4 +973,27 @@ func calculateExpiryOverride(overrideExpiry int64, leaderboard *Leaderboard) (in
 		}
 	}
 	return overrideExpiry, true
+}
+
+func disableLeaderboardRanks(ctx context.Context, logger *zap.Logger, db *sql.DB, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, id string) error {
+	l := leaderboardCache.Get(id)
+	if l == nil || l.IsTournament() {
+		return runtime.ErrLeaderboardNotFound
+	}
+
+	if _, err := db.QueryContext(ctx, "UPDATE leaderboard SET enable_ranks = false WHERE id = $1", id); err != nil {
+		logger.Error("failed to set leaderboard enable_ranks value", zap.Error(err))
+		return errors.New("failed to disable tournament ranks")
+	}
+
+	leaderboardCache.Insert(l.Id, l.Authoritative, l.SortOrder, l.Operator, l.ResetScheduleStr, l.Metadata, l.CreateTime, false)
+
+	expiryTime := int64(0)
+	if l.ResetSchedule != nil {
+		expiryTime = l.ResetSchedule.Next(time.Now().UTC()).UTC().Unix()
+	}
+
+	rankCache.DeleteLeaderboard(l.Id, expiryTime)
+
+	return nil
 }

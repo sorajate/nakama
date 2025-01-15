@@ -14,7 +14,7 @@ func fieldName(k string) string {
 	return strings.ReplaceAll(cases.Title(language.AmericanEnglish).String(k), "-", "_")
 }
 
-//this method will filter the same fields and return the unique one
+// this method will filter the same fields and return the unique one
 func getUniqueFields(schemaFieldsRequired []string, fieldsRequired []string) []string {
 	var unique []string
 	var index *int
@@ -22,6 +22,7 @@ func getUniqueFields(schemaFieldsRequired []string, fieldsRequired []string) []s
 	for j, schemaFieldRequired := range schemaFieldsRequired {
 		index = nil
 		for i, fieldRequired := range fieldsRequired {
+			i := i
 			if schemaFieldRequired == fieldRequired {
 				index = &i
 				break

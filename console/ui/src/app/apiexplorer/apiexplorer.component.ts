@@ -14,31 +14,34 @@
 
 import {AfterViewInit, Component, ElementRef, Injectable, OnInit, ViewChild} from '@angular/core';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, Router, RouterStateSnapshot} from '@angular/router';
-import {ApiEndpointDescriptor, ApiEndpointList, CallApiEndpointRequest, ConsoleService,} from '../console.service';
-import {FormBuilder, FormGroup, Validators} from '@angular/forms';
+import {ApiEndpointDescriptor, ApiEndpointList, CallApiEndpointRequest, ConsoleService} from '../console.service';
+import {UntypedFormBuilder, UntypedFormGroup, Validators} from '@angular/forms';
 import {Observable} from 'rxjs';
-import * as ace from 'ace-builds';
+import {JSONEditor, Mode, toJSONContent, toTextContent} from 'vanilla-jsoneditor';
 
 @Component({
   templateUrl: './apiexplorer.component.html',
   styleUrls: ['./apiexplorer.component.scss']
 })
 export class ApiExplorerComponent implements OnInit, AfterViewInit {
-  @ViewChild('editor') private editor: ElementRef<HTMLElement>;
-  @ViewChild('editorResponse') private editorResponse: ElementRef<HTMLElement>;
+  @ViewChild('editorReq') private editorReq: ElementRef<HTMLElement>;
+  @ViewChild('editorVars') private editorVars: ElementRef<HTMLElement>;
+  @ViewChild('editorRes') private editorRes: ElementRef<HTMLElement>;
 
-  private aceEditor: ace.Ace.Editor;
-  private aceEditorResponse: ace.Ace.Editor;
+  private jsonEditorReq: JSONEditor;
+  private jsonEditorVars: JSONEditor;
+  private jsonEditorRes: JSONEditor;
   public error = '';
   public rpcEndpoints: Array<ApiEndpointDescriptor> = [];
   public endpoints: Array<ApiEndpointDescriptor> = [];
-  public endpointCallForm: FormGroup;
+  public endpointCallForm: UntypedFormGroup;
+  public addVars = false;
 
   constructor(
     private readonly route: ActivatedRoute,
     private readonly router: Router,
     private readonly consoleService: ConsoleService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
   ) {}
 
   ngOnInit(): void {
@@ -74,33 +77,63 @@ export class ApiExplorerComponent implements OnInit, AfterViewInit {
   }
 
   ngAfterViewInit(): void {
-    ace.config.set('fontSize', '14px');
-    ace.config.set('printMarginColumn', 0);
-    ace.config.set('useWorker', true);
-    ace.config.set('highlightSelectedWord', true);
-    ace.config.set('fontFamily', '"Courier New", Courier, monospace');
-    this.aceEditor = ace.edit(this.editor.nativeElement);
-    this.aceEditor.setReadOnly(true);
-    this.aceEditorResponse = ace.edit(this.editorResponse.nativeElement);
-    this.aceEditorResponse.setReadOnly(true);
+    this.jsonEditorReq = new JSONEditor({
+      target: this.editorReq.nativeElement,
+      props: {
+        mode: Mode.text,
+        readOnly: true,
+      },
+    });
+    this.jsonEditorVars = new JSONEditor({
+      target: this.editorVars.nativeElement,
+      props: {
+        mode: Mode.text,
+      },
+    });
+    this.jsonEditorRes = new JSONEditor({
+      target: this.editorRes.nativeElement,
+      props: {
+        mode: Mode.text,
+        readOnly: true,
+      },
+    });
   }
 
   public sendRequest(): void {
     this.error = '';
 
-    let value = this.aceEditor.session.getValue();
-    if (value !== '') {
-      try {
-        value = JSON.stringify(JSON.parse(value));
-      } catch (e) {
-        this.error = e;
-        return;
+    let value = '';
+    try {
+      value = toTextContent(this.jsonEditorReq.get()).text;
+    } catch (e) {
+      this.error = e;
+      return;
+    }
+
+    let vars = {};
+    try {
+      const textVars = toTextContent(this.jsonEditorVars.get()).text;
+      if (textVars !== '') {
+        const varsObj = JSON.parse(textVars);
+        Object.keys(varsObj).forEach((k) => {
+          if (typeof k !== 'string')  {
+            throw new Error(`Invalid session variables: ${k} must be a string`);
+          }
+          if (typeof varsObj[k] !== 'string') {
+            throw new Error(`Invalid session variables: ${varsObj[k]} must be a string`);
+          }
+        });
+        vars = varsObj;
       }
+    } catch (e) {
+      this.error = e;
+      return;
     }
 
     const req: CallApiEndpointRequest = {
       user_id: this.f.user_id.value,
       body: value,
+      session_vars: vars as Map<string, string>,
     };
 
     let endpointCall = null;
@@ -111,19 +144,23 @@ export class ApiExplorerComponent implements OnInit, AfterViewInit {
     }
     endpointCall.subscribe(resp => {
       if (resp.error_message && resp.error_message !== '') {
-        this.aceEditorResponse.session.setValue(resp.error_message);
+        this.jsonEditorRes.set({json: resp.error_message});
       } else {
         value = '';
         try {
-          value = JSON.stringify(JSON.parse(resp.body), null, 2);
+          if (resp.body === '') {
+            value = resp.body;
+          } else {
+            value = JSON.stringify(JSON.parse(resp.body), null, 2);
+          }
         } catch (e) {
           this.error = e;
           return;
         }
-        this.aceEditorResponse.session.setValue(value);
+        this.jsonEditorRes.set({text: value});
       }
     }, error => {
-      this.aceEditorResponse.session.setValue('');
+      this.jsonEditorRes.set({text: ''});
       this.error = error;
     });
   }
@@ -135,22 +172,23 @@ export class ApiExplorerComponent implements OnInit, AfterViewInit {
   }
 
   setupRequestBody(body): void {
-    if (this.aceEditor == null) {
-      console.log('problem?');
+    if (this.jsonEditorReq == null) {
       // not initialised yet
       return;
     }
 
     if (!body || body === '') {
-      this.aceEditor.session.setValue('');
-      this.aceEditor.setReadOnly(!this.isRpcEndpoint(this.f.method.value));
+      this.jsonEditorReq.set({text: ''});
+      this.jsonEditorReq.updateProps({
+        readOnly: !this.isRpcEndpoint(this.f.method.value)
+      });
       return;
     }
 
     try {
       const value = JSON.stringify(JSON.parse(body), null, 2);
-      this.aceEditor.session.setValue(value);
-      this.aceEditor.setReadOnly(false);
+      this.jsonEditorReq.set({text: value});
+      this.jsonEditorReq.updateProps({readOnly: false});
     } catch (e) {
       this.error = e;
       return;
@@ -164,6 +202,16 @@ export class ApiExplorerComponent implements OnInit, AfterViewInit {
         endpoint,
       },
       queryParamsHandling: 'merge',
+    });
+  }
+
+  addSessionVars(): void {
+    this.addVars = true;
+    this.jsonEditorVars.set({
+      json: {
+        '<key1>': '<value1>',
+        '<key2>': '<value2>',
+      }
     });
   }
 

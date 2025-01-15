@@ -21,19 +21,20 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
-	"github.com/gofrs/uuid"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama/v3/console"
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"regexp"
-	"strconv"
-	"strings"
 )
 
 var validTrigramFilterRegex = regexp.MustCompile("^%?[^%]{3,}%?$")
@@ -82,11 +83,8 @@ func (s *ConsoleServer) DeleteAccount(ctx context.Context, in *console.AccountDe
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "Requires a valid user ID.")
 	}
-	if userID == uuid.Nil {
-		return nil, status.Error(codes.InvalidArgument, "Cannot delete the system user.")
-	}
 
-	if err = DeleteAccount(ctx, s.logger, s.db, s.config, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, in.RecordDeletion != nil && in.RecordDeletion.Value); err != nil {
+	if err = DeleteAccount(ctx, s.logger, s.db, s.config, s.leaderboardCache, s.leaderboardRankCache, s.sessionRegistry, s.sessionCache, s.tracker, userID, in.RecordDeletion != nil && in.RecordDeletion.Value); err != nil {
 		// Error already logged in function above.
 		return nil, status.Error(codes.Internal, "An error occurred while trying to delete the user.")
 	}
@@ -374,7 +372,7 @@ func (s *ConsoleServer) ListAccounts(ctx context.Context, in *console.ListAccoun
 
 	// Filtered queries do not observe cursor or limit inputs, and do not return cursors.
 	if in.Filter != "" {
-		// Exact match based on username or social identifiers, and any.
+		// Exact match based on username or social identifiers, if any.
 		params := []interface{}{in.Filter}
 		query := `
 			SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
@@ -387,6 +385,7 @@ func (s *ConsoleServer) ListAccounts(ctx context.Context, in *console.ListAccoun
 					OR custom_id = $1
 				  OR facebook_instant_game_id = $1
 					OR apple_id = $1
+					OR email = $1
 			UNION
 			SELECT u.id, username, display_name, avatar_url, lang_tag, location, timezone, metadata, apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
       	FROM users u JOIN user_device ud on u.id = ud.user_id
@@ -692,13 +691,7 @@ func (s *ConsoleServer) UpdateAccount(ctx context.Context, in *console.UpdateAcc
 		return &emptypb.Empty{}, nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		s.logger.Error("Could not begin database transaction.", zap.Error(err))
-		return nil, status.Error(codes.Internal, "An error occurred while trying to update the user.")
-	}
-
-	if err = ExecuteInTx(ctx, tx, func() error {
+	if err = ExecuteInTx(ctx, s.db, func(tx *sql.Tx) error {
 		for oldDeviceID, newDeviceID := range in.DeviceIds {
 			if newDeviceID == "" {
 				query := `DELETE FROM user_device WHERE id = $2 AND user_id = $1

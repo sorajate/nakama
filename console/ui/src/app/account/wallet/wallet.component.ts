@@ -23,8 +23,9 @@ import {
 } from '../../console.service';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, Router, RouterStateSnapshot} from '@angular/router';
 import {AuthenticationService} from '../../authentication.service';
-import * as ace from 'ace-builds';
+import {JSONEditor, Mode, toTextContent} from 'vanilla-jsoneditor';
 import {Observable} from 'rxjs';
+import {DeleteConfirmService} from '../../shared/delete-confirm.service';
 
 @Component({
   templateUrl: './wallet.component.html',
@@ -33,7 +34,7 @@ import {Observable} from 'rxjs';
 export class WalletComponent implements OnInit, AfterViewInit {
   @ViewChild('editor') private editor: ElementRef<HTMLElement>;
 
-  private aceEditor: ace.Ace.Editor;
+  private jsonEditor: JSONEditor;
   public error = '';
   public account: ApiAccount;
   public walletLedger: Array<WalletLedger> = [];
@@ -50,6 +51,7 @@ export class WalletComponent implements OnInit, AfterViewInit {
     private readonly router: Router,
     private readonly consoleService: ConsoleService,
     private readonly authService: AuthenticationService,
+    private readonly deleteConfirmService: DeleteConfirmService,
   ) {}
 
   ngOnInit(): void {
@@ -92,16 +94,14 @@ export class WalletComponent implements OnInit, AfterViewInit {
   }
 
   ngAfterViewInit(): void {
-    ace.config.set('fontSize', '14px');
-    ace.config.set('printMarginColumn', 0);
-    ace.config.set('useWorker', true);
-    ace.config.set('highlightSelectedWord', true);
-    ace.config.set('fontFamily', '"Courier New", Courier, monospace');
-    this.aceEditor = ace.edit(this.editor.nativeElement);
-    this.aceEditor.setReadOnly(!this.updateAllowed());
-
-    const value = JSON.stringify(JSON.parse(this.account.wallet), null, 2);
-    this.aceEditor.session.setValue(value);
+    this.jsonEditor = new JSONEditor({
+      target: this.editor.nativeElement,
+      props: {
+        mode: Mode.text,
+        readOnly: !this.updateAllowed(),
+        content: {text: this.account.wallet},
+      },
+    });
   }
 
   updateWallet(): void {
@@ -111,7 +111,7 @@ export class WalletComponent implements OnInit, AfterViewInit {
 
     let wallet = '';
     try {
-      wallet = JSON.stringify(JSON.parse(this.aceEditor.session.getValue()));
+      wallet = toTextContent(this.jsonEditor.get()).text;
     } catch (e) {
       this.error = e;
       this.updating = false;
@@ -137,16 +137,20 @@ export class WalletComponent implements OnInit, AfterViewInit {
   }
 
   deleteLedgerItem(event, i: number, w: WalletLedger): void {
-    event.target.disabled = true;
-    event.preventDefault();
-    this.error = '';
-    this.consoleService.deleteWalletLedger('', this.account.user.id, w.id).subscribe(() => {
-      this.error = '';
-      this.walletLedger.splice(i, 1);
-      this.walletLedgerMetadataOpen.splice(i, 1);
-    }, err => {
-      this.error = err;
-    });
+    this.deleteConfirmService.openDeleteConfirmModal(
+      () => {
+        event.target.disabled = true;
+        event.preventDefault();
+        this.error = '';
+        this.consoleService.deleteWalletLedger('', this.account.user.id, w.id).subscribe(() => {
+          this.error = '';
+          this.walletLedger.splice(i, 1);
+          this.walletLedgerMetadataOpen.splice(i, 1);
+        }, err => {
+          this.error = err;
+        });
+      }
+    );
   }
 }
 

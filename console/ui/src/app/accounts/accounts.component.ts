@@ -12,35 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {Component, Injectable, OnInit} from '@angular/core';
+import {Component, Injectable, OnInit, OnDestroy} from '@angular/core';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, Router, RouterStateSnapshot} from '@angular/router';
 import {AccountList, ApiUser, ConsoleService, UserRole} from '../console.service';
-import {Observable} from 'rxjs';
-import {FormBuilder, FormGroup} from '@angular/forms';
+import {Observable, Subject} from 'rxjs';
+import {UntypedFormBuilder, UntypedFormGroup} from '@angular/forms';
 import {AuthenticationService} from '../authentication.service';
+import {DeleteConfirmService} from '../shared/delete-confirm.service';
+import {takeUntil} from 'rxjs/operators';
 
 @Component({
   templateUrl: './accounts.component.html',
   styleUrls: ['./accounts.component.scss']
 })
-export class AccountListComponent implements OnInit {
+export class AccountListComponent implements OnInit, OnDestroy {
   public readonly systemUserId = '00000000-0000-0000-0000-000000000000';
   public error = '';
   public accountsCount = 0;
   public accounts: Array<ApiUser> = [];
   public nextCursor = '';
   public prevCursor = '';
-  public searchForm: FormGroup;
+  public searchForm: UntypedFormGroup;
+  public querySubject: Subject<void>;
+  public ongoingQuery = false;
 
   constructor(
     private readonly route: ActivatedRoute,
     private readonly router: Router,
     private readonly consoleService: ConsoleService,
     private readonly authService: AuthenticationService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
+    private readonly deleteConfirmService: DeleteConfirmService,
   ) {}
 
   ngOnInit(): void {
+    this.querySubject = new Subject<void>();
     this.searchForm = this.formBuilder.group({
       filter: [''],
       filter_type: [0], // 0 for all, 1 for tombstones
@@ -72,7 +78,17 @@ export class AccountListComponent implements OnInit {
       });
   }
 
+  ngOnDestroy(): void {
+    this.querySubject.next();
+    this.querySubject.complete();
+  }
+
   search(state: number): void {
+    if (this.ongoingQuery) {
+      this.querySubject.next();
+    }
+    this.ongoingQuery = true;
+
     let cursor = '';
     switch (state) {
       case -1:
@@ -87,7 +103,10 @@ export class AccountListComponent implements OnInit {
     }
 
     const tombstones = this.f.filter_type.value && this.f.filter_type.value === 1;
-    this.consoleService.listAccounts('', this.f.filter.value, tombstones, cursor).subscribe(d => {
+
+    this.consoleService.listAccounts('', this.f.filter.value, tombstones, cursor)
+      .pipe(takeUntil(this.querySubject))
+      .subscribe(d => {
       this.error = '';
 
       this.accounts.length = 0;
@@ -104,22 +123,33 @@ export class AccountListComponent implements OnInit {
         },
         queryParamsHandling: 'merge',
       });
+      this.ongoingQuery = false;
     }, err => {
       this.error = err;
+      this.ongoingQuery = false;
     });
   }
 
+  cancelQuery(): void {
+    this.querySubject.next();
+    this.ongoingQuery = false;
+  }
+
   deleteAccount(event, i: number, o: ApiUser): void {
-    event.target.disabled = true;
-    event.preventDefault();
-    this.error = '';
-    this.consoleService.deleteAccount('', o.id, false).subscribe(() => {
-      this.error = '';
-      this.accounts.splice(i, 1);
-      this.accountsCount--;
-    }, err => {
-      this.error = err;
-    });
+    this.deleteConfirmService.openDeleteConfirmModal(
+      () => {
+        event.target.disabled = true;
+        event.preventDefault();
+        this.error = '';
+        this.consoleService.deleteAccount('', o.id, false).subscribe(() => {
+          this.error = '';
+          this.accounts.splice(i, 1);
+          this.accountsCount--;
+        }, err => {
+          this.error = err;
+        });
+      }
+    );
   }
 
   deleteAllowed(): boolean {

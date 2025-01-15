@@ -16,8 +16,9 @@ import {Component, Injectable, OnInit} from '@angular/core';
 import {ActivatedRoute, ActivatedRouteSnapshot, Resolve, Router, RouterStateSnapshot} from '@angular/router';
 import {GroupList, ApiGroup, ConsoleService, UserRole} from '../console.service';
 import {Observable} from 'rxjs';
-import {FormBuilder, FormGroup} from '@angular/forms';
+import {UntypedFormBuilder, UntypedFormGroup} from '@angular/forms';
 import {AuthenticationService} from '../authentication.service';
+import {DeleteConfirmService} from '../shared/delete-confirm.service';
 
 @Component({
   templateUrl: './groups.component.html',
@@ -30,14 +31,15 @@ export class GroupListComponent implements OnInit {
   public groups: Array<ApiGroup> = [];
   public nextCursor = '';
   public prevCursor = '';
-  public searchForm: FormGroup;
+  public searchForm: UntypedFormGroup;
 
   constructor(
     private readonly route: ActivatedRoute,
     private readonly router: Router,
     private readonly consoleService: ConsoleService,
     private readonly authService: AuthenticationService,
-    private readonly formBuilder: FormBuilder,
+    private readonly formBuilder: UntypedFormBuilder,
+    private readonly deleteConfirmService: DeleteConfirmService,
   ) {}
 
   ngOnInit(): void {
@@ -106,16 +108,20 @@ export class GroupListComponent implements OnInit {
   }
 
   deleteGroup(event, i: number, o: ApiGroup): void {
-    event.target.disabled = true;
-    event.preventDefault();
-    this.error = '';
-    this.consoleService.deleteGroup('', o.id).subscribe(() => {
-      this.error = '';
-      this.groups.splice(i, 1);
-      this.groupsCount--;
-    }, err => {
-      this.error = err;
-    });
+    this.deleteConfirmService.openDeleteConfirmModal(
+      () => {
+        event.target.disabled = true;
+        event.preventDefault();
+        this.error = '';
+        this.consoleService.deleteGroup('', o.id).subscribe(() => {
+          this.error = '';
+          this.groups.splice(i, 1);
+          this.groupsCount--;
+        }, err => {
+          this.error = err;
+        });
+      }
+    );
   }
 
   deleteAllowed(): boolean {

@@ -27,7 +27,7 @@ import (
 
 	"github.com/blugelabs/bluge"
 	"github.com/blugelabs/bluge/index"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -147,7 +147,6 @@ type LocalMatchRegistry struct {
 }
 
 func NewLocalMatchRegistry(logger, startupLogger *zap.Logger, config Config, sessionRegistry SessionRegistry, tracker Tracker, router MessageRouter, metrics Metrics, node string) MatchRegistry {
-
 	cfg := BlugeInMemoryConfig()
 	indexWriter, err := bluge.OpenWriter(cfg)
 	if err != nil {
@@ -886,7 +885,7 @@ func MapMatchIndexEntry(id string, in *MatchIndexEntry) (*bluge.Document, error)
 	rv.AddField(bluge.NewNumericField("create_time", float64(in.CreateTime)).StoreValue())
 
 	if in.Label != nil {
-		BlugeWalkDocument(in.Label, []string{"label"}, rv)
+		BlugeWalkDocument(in.Label, []string{"label"}, map[string]bool{}, rv)
 	}
 
 	return rv, nil

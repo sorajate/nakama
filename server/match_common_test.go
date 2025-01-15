@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"go.uber.org/atomic"
@@ -57,8 +57,7 @@ func createTestMatchRegistry(t fatalable, logger *zap.Logger) (*LocalMatchRegist
 	mp := NewMatchProvider()
 
 	mp.RegisterCreateFn("go",
-		func(ctx context.Context, logger *zap.Logger, id uuid.UUID, node string, stopped *atomic.Bool,
-			name string) (RuntimeMatchCore, error) {
+		func(ctx context.Context, logger *zap.Logger, id uuid.UUID, node string, stopped *atomic.Bool, name string) (RuntimeMatchCore, error) {
 			match, err := newTestMatch(context.Background(), NewRuntimeGoLogger(logger), nil, nil)
 			if err != nil {
 				return nil, err
@@ -82,13 +81,11 @@ type testMatchState struct {
 // testMatch is a minimal implementation of runtime.Match for testing purposes
 type testMatch struct{}
 
-func newTestMatch(ctx context.Context, logger runtime.Logger, db *sql.DB,
-	nk runtime.NakamaModule) (m runtime.Match, err error) {
+func newTestMatch(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule) (m runtime.Match, err error) {
 	return &testMatch{}, nil
 }
 
-func (m *testMatch) MatchInit(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	params map[string]interface{}) (interface{}, int, string) {
+func (m *testMatch) MatchInit(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, params map[string]interface{}) (interface{}, int, string) {
 	state := &testMatchState{
 		presences: make(map[string]runtime.Presence),
 	}
@@ -104,15 +101,12 @@ func (m *testMatch) MatchInit(ctx context.Context, logger runtime.Logger, db *sq
 	return state, tickRate, label
 }
 
-func (m *testMatch) MatchJoinAttempt(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presence runtime.Presence,
-	metadata map[string]string) (interface{}, bool, string) {
+func (m *testMatch) MatchJoinAttempt(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presence runtime.Presence, metadata map[string]string) (interface{}, bool, string) {
 	acceptUser := true
 	return state, acceptUser, ""
 }
 
-func (m *testMatch) MatchJoin(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
+func (m *testMatch) MatchJoin(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
 	mState, _ := state.(*testMatchState)
 	for _, p := range presences {
 		mState.presences[p.GetUserId()] = p
@@ -120,8 +114,7 @@ func (m *testMatch) MatchJoin(ctx context.Context, logger runtime.Logger, db *sq
 	return mState
 }
 
-func (m *testMatch) MatchLeave(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
+func (m *testMatch) MatchLeave(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, presences []runtime.Presence) interface{} {
 	mState, _ := state.(*testMatchState)
 	for _, p := range presences {
 		delete(mState.presences, p.GetUserId())
@@ -129,8 +122,7 @@ func (m *testMatch) MatchLeave(ctx context.Context, logger runtime.Logger, db *s
 	return mState
 }
 
-func (m *testMatch) MatchLoop(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, messages []runtime.MatchData) interface{} {
+func (m *testMatch) MatchLoop(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, messages []runtime.MatchData) interface{} {
 	mState, _ := state.(*testMatchState)
 	for _, presence := range mState.presences {
 		logger.Info("Presence %v named %v", presence.GetUserId(), presence.GetUsername())
@@ -138,21 +130,23 @@ func (m *testMatch) MatchLoop(ctx context.Context, logger runtime.Logger, db *sq
 	for _, message := range messages {
 		logger.Info("Received %v from %v", string(message.GetData()), message.GetUserId())
 		reliable := true
-		dispatcher.BroadcastMessage(1, message.GetData(), []runtime.Presence{message}, nil, reliable)
+		if err := dispatcher.BroadcastMessage(1, message.GetData(), []runtime.Presence{message}, nil, reliable); err != nil {
+			logger.Error("Failed to broadcast message: %w", err)
+		}
 	}
 	return mState
 }
 
-func (m *testMatch) MatchTerminate(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, graceSeconds int) interface{} {
+func (m *testMatch) MatchTerminate(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, graceSeconds int) interface{} {
 	message := "Server shutting down in " + strconv.Itoa(graceSeconds) + " seconds."
 	reliable := true
-	dispatcher.BroadcastMessage(2, []byte(message), []runtime.Presence{}, nil, reliable)
+	if err := dispatcher.BroadcastMessage(2, []byte(message), []runtime.Presence{}, nil, reliable); err != nil {
+		logger.Error("Failed to broadcast message: %w", err)
+	}
 	return state
 }
 
-func (m *testMatch) MatchSignal(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule,
-	dispatcher runtime.MatchDispatcher, tick int64, state interface{}, data string) (interface{}, string) {
+func (m *testMatch) MatchSignal(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, dispatcher runtime.MatchDispatcher, tick int64, state interface{}, data string) (interface{}, string) {
 	return state, "signal received: " + data
 }
 
@@ -166,6 +160,7 @@ func (s *testMetrics) SnapshotRecvKbSec() float64 { return 0 }
 func (s *testMetrics) SnapshotSentKbSec() float64 { return 0 }
 func (s *testMetrics) Api(name string, elapsed time.Duration, recvBytes, sentBytes int64, isErr bool) {
 }
+
 func (s *testMetrics) ApiRpc(id string, elapsed time.Duration, recvBytes, sentBytes int64, isErr bool) {
 }
 func (s *testMetrics) ApiBefore(name string, elapsed time.Duration, isErr bool)             {}
@@ -176,9 +171,11 @@ func (s *testMetrics) GaugeRuntimes(value float64)                              
 func (s *testMetrics) GaugeLuaRuntimes(value float64)                                       {}
 func (s *testMetrics) GaugeJsRuntimes(value float64)                                        {}
 func (s *testMetrics) GaugeAuthoritativeMatches(value float64)                              {}
+func (s *testMetrics) GaugeStorageIndexEntries(indexName string, value float64)             {}
 func (s *testMetrics) CountDroppedEvents(delta int64)                                       {}
 func (s *testMetrics) CountWebsocketOpened(delta int64)                                     {}
 func (s *testMetrics) CountWebsocketClosed(delta int64)                                     {}
+func (m *testMetrics) CountUntaggedGrpcStatsCalls(delta int64)                              {}
 func (s *testMetrics) GaugeSessions(value float64)                                          {}
 func (s *testMetrics) GaugePresences(value float64)                                         {}
 func (s *testMetrics) Matchmaker(tickets, activeTickets float64, processTime time.Duration) {}
@@ -194,14 +191,14 @@ type testMessageRouter struct {
 	sendToPresence func(presences []*PresenceID, envelope *rtapi.Envelope)
 }
 
-func (s *testMessageRouter) SendToPresenceIDs(_ *zap.Logger, presences []*PresenceID,
-	envelope *rtapi.Envelope, _ bool) {
+func (s *testMessageRouter) SendToPresenceIDs(_ *zap.Logger, presences []*PresenceID, envelope *rtapi.Envelope, _ bool) {
 	if s.sendToPresence != nil {
 		s.sendToPresence(presences, envelope)
 	}
 }
 func (s *testMessageRouter) SendToStream(*zap.Logger, PresenceStream, *rtapi.Envelope, bool) {}
 func (s *testMessageRouter) SendDeferred(*zap.Logger, []*DeferredMessage)                    {}
+func (s *testMessageRouter) SendToAll(*zap.Logger, *rtapi.Envelope, bool)                    {}
 
 // testTracker implements the Tracker interface and does nothing
 type testTracker struct{}
@@ -213,12 +210,11 @@ func (s *testTracker) SetPartyLeaveListener(func(id uuid.UUID, leaves []*Presenc
 func (s *testTracker) Stop()                                                             {}
 
 // Track returns success true/false, and new presence true/false.
-func (s *testTracker) Track(ctx context.Context, sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID,
-	meta PresenceMeta, allowIfFirstForSession bool) (bool, bool) {
+func (s *testTracker) Track(ctx context.Context, sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID, meta PresenceMeta) (bool, bool) {
 	return true, true
 }
-func (s *testTracker) TrackMulti(ctx context.Context, sessionID uuid.UUID, ops []*TrackerOp, userID uuid.UUID,
-	allowIfFirstForSession bool) bool {
+
+func (s *testTracker) TrackMulti(ctx context.Context, sessionID uuid.UUID, ops []*TrackerOp, userID uuid.UUID) bool {
 	return true
 }
 func (s *testTracker) Untrack(sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID) {}
@@ -228,8 +224,7 @@ func (s *testTracker) UntrackAll(sessionID uuid.UUID, reason runtime.PresenceRea
 
 // Update returns success true/false - will only fail if the user has no presence and allowIfFirstForSession is false,
 // otherwise is an upsert.
-func (s *testTracker) Update(ctx context.Context, sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID,
-	meta PresenceMeta, allowIfFirstForSession bool) bool {
+func (s *testTracker) Update(ctx context.Context, sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID, meta PresenceMeta) bool {
 	return true
 }
 
@@ -269,14 +264,12 @@ func (s *testTracker) CountByStreamModeFilter(modes map[uint8]*uint8) map[*Prese
 }
 
 // Check if a single presence on the current node exists.
-func (s *testTracker) GetLocalBySessionIDStreamUserID(sessionID uuid.UUID, stream PresenceStream,
-	userID uuid.UUID) *PresenceMeta {
+func (s *testTracker) GetLocalBySessionIDStreamUserID(sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID) *PresenceMeta {
 	return nil
 }
 
 // Check if a single presence on any node exists.
-func (s *testTracker) GetBySessionIDStreamUserID(node string, sessionID uuid.UUID, stream PresenceStream,
-	userID uuid.UUID) *PresenceMeta {
+func (s *testTracker) GetBySessionIDStreamUserID(node string, sessionID uuid.UUID, stream PresenceStream, userID uuid.UUID) *PresenceMeta {
 	return nil
 }
 
@@ -295,6 +288,8 @@ func (s *testTracker) ListPresenceIDByStream(stream PresenceStream) []*PresenceI
 	return nil
 }
 
+func (s *testTracker) ListPresenceIDByStreams(fill map[PresenceStream][]*PresenceID) {}
+
 // testSessionRegistry implements SessionRegistry interface and does nothing
 type testSessionRegistry struct{}
 
@@ -312,10 +307,12 @@ func (s *testSessionRegistry) Add(session Session) {}
 
 func (s *testSessionRegistry) Remove(sessionID uuid.UUID) {}
 
-func (s *testSessionRegistry) Disconnect(ctx context.Context, sessionID uuid.UUID, ban bool,
-	reason ...runtime.PresenceReason) error {
+func (s *testSessionRegistry) Disconnect(ctx context.Context, sessionID uuid.UUID, ban bool, reason ...runtime.PresenceReason) error {
 	return nil
 }
 
 func (s *testSessionRegistry) SingleSession(ctx context.Context, tracker Tracker, userID, sessionID uuid.UUID) {
+}
+
+func (s *testSessionRegistry) Range(fn func(session Session) bool) {
 }

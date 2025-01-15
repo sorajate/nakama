@@ -53,8 +53,10 @@ type Metrics interface {
 	CountDroppedEvents(delta int64)
 	CountWebsocketOpened(delta int64)
 	CountWebsocketClosed(delta int64)
+	CountUntaggedGrpcStatsCalls(delta int64)
 	GaugeSessions(value float64)
 	GaugePresences(value float64)
+	GaugeStorageIndexEntries(indexName string, value float64)
 
 	Matchmaker(tickets, activeTickets float64, processTime time.Duration)
 
@@ -162,7 +164,7 @@ func NewLocalMetrics(logger, startupLogger *zap.Logger, db *sql.DB, config Confi
 		// Create a HTTP server to expose Prometheus metrics through.
 		CORSHeaders := handlers.AllowedHeaders([]string{"Content-Type", "User-Agent"})
 		CORSOrigins := handlers.AllowedOrigins([]string{"*"})
-		CORSMethods := handlers.AllowedMethods([]string{"GET", "HEAD"})
+		CORSMethods := handlers.AllowedMethods([]string{http.MethodGet, http.MethodHead})
 		handlerWithCORS := handlers.CORS(CORSHeaders, CORSOrigins, CORSMethods)(m.refreshDBStats(reporter.HTTPHandler()))
 		m.prometheusHTTPServer = &http.Server{
 			Addr:         fmt.Sprintf(":%d", config.GetMetrics().PrometheusPort),
@@ -407,6 +409,11 @@ func (m *LocalMetrics) CountWebsocketClosed(delta int64) {
 	m.PrometheusScope.Counter("socket_ws_closed").Inc(delta)
 }
 
+// Increment the number of untagged gRpc stats calls.
+func (m *LocalMetrics) CountUntaggedGrpcStatsCalls(delta int64) {
+	m.PrometheusScope.Counter("untagged_grpc_stats_calls").Inc(delta)
+}
+
 // Set the absolute value of currently active sessions.
 func (m *LocalMetrics) GaugeSessions(value float64) {
 	m.PrometheusScope.Gauge("sessions").Update(value)
@@ -415,6 +422,10 @@ func (m *LocalMetrics) GaugeSessions(value float64) {
 // Set the absolute value of currently tracked presences.
 func (m *LocalMetrics) GaugePresences(value float64) {
 	m.PrometheusScope.Gauge("presences").Update(value)
+}
+
+func (m *LocalMetrics) GaugeStorageIndexEntries(indexName string, value float64) {
+	m.PrometheusScope.Tagged(map[string]string{"index_name": indexName}).Gauge("storage_index_entry_count").Update(value)
 }
 
 // Record a set of matchmaker metrics.
